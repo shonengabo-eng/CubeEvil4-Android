@@ -4,6 +4,8 @@ name: EmuELEC core (aarch64, glibc 2.28)
 # libstdc++ hasta GLIBCXX_3.4.25). Usa un sysroot de Debian buster (glibc 2.28,
 # gcc-8) para que los binarios no pidan simbolos mas nuevos que los de la caja.
 # Se lanza a mano: pestana Actions -> "EmuELEC core" -> Run workflow.
+# v5: rutas del sysroot dentro de envoltorios /opt/wrap/clang(++) (el plan de enlazado
+#     del proyecto llamaba a clang++ sin ellas y no encontraba crti.o, -lc, -lm...).
 # v4: libgcc_s.so y libstdc++.so creados a mano (ld.lld no encontraba -lgcc_s).
 # v3: desempaqueta a mano los .deb de --include (v2 los dejaba sin abrir).
 # v2: sin --gcc-install-dir (clang no encontraba el GCC del sysroot); rutas
@@ -64,26 +66,47 @@ jobs:
           echo "== cabeceras de C++ =="
           ls /opt/sysroot/usr/include/c++/ /opt/sysroot/usr/include/aarch64-linux-gnu/c++/ || true
 
-      - name: Toolchain de CMake
+      - name: Toolchain de CMake (con envoltorios de clang)
         run: |
+          # El proyecto llama a veces a "clang++ --target=..." por su cuenta (plan de
+          # enlazado de port/tools/whole_link_plan.py) sin pasar las rutas del sysroot.
+          # Por eso las rutas van dentro de un envoltorio y no en las flags de CMake.
+          sudo mkdir -p /opt/wrap
+          sudo tee /opt/wrap/clang++ > /dev/null <<'EOF'
+          #!/bin/bash
+          S=/opt/sysroot
+          G=$S/usr/lib/gcc/aarch64-linux-gnu/8
+          extra=(--sysroot=$S -nostdinc++ -isystem $S/usr/include/c++/8 -isystem $S/usr/include/aarch64-linux-gnu/c++/8 -isystem $S/usr/include/c++/8/backward)
+          link=1
+          for a in "$@"; do
+            case "$a" in -c|-E|-S) link=0 ;; esac
+          done
+          if [ $link = 1 ]; then extra+=(-fuse-ld=lld -B$G -L$G); fi
+          exec /usr/bin/clang++ "${extra[@]}" "$@"
+          EOF
+          sudo tee /opt/wrap/clang > /dev/null <<'EOF'
+          #!/bin/bash
+          S=/opt/sysroot
+          G=$S/usr/lib/gcc/aarch64-linux-gnu/8
+          extra=(--sysroot=$S)
+          link=1
+          for a in "$@"; do
+            case "$a" in -c|-E|-S) link=0 ;; esac
+          done
+          if [ $link = 1 ]; then extra+=(-fuse-ld=lld -B$G -L$G); fi
+          exec /usr/bin/clang "${extra[@]}" "$@"
+          EOF
+          sudo chmod +x /opt/wrap/clang /opt/wrap/clang++
           cat > "$GITHUB_WORKSPACE/emuelec-aarch64.cmake" <<'EOF'
           set(CMAKE_SYSTEM_NAME Linux)
           set(CMAKE_SYSTEM_PROCESSOR aarch64)
-          set(RE4_SYSROOT /opt/sysroot)
-          set(RE4_GCCDIR ${RE4_SYSROOT}/usr/lib/gcc/aarch64-linux-gnu/8)
-          set(CMAKE_SYSROOT ${RE4_SYSROOT})
-          set(CMAKE_C_COMPILER clang)
-          set(CMAKE_CXX_COMPILER clang++)
+          set(CMAKE_C_COMPILER /opt/wrap/clang)
+          set(CMAKE_CXX_COMPILER /opt/wrap/clang++)
+          set(CMAKE_ASM_COMPILER /opt/wrap/clang)
           set(CMAKE_C_COMPILER_TARGET aarch64-linux-gnu)
           set(CMAKE_CXX_COMPILER_TARGET aarch64-linux-gnu)
           set(CMAKE_ASM_COMPILER_TARGET aarch64-linux-gnu)
-          # libstdc++ de gcc-8 a mano (sin la deteccion de GCC de clang)
-          set(CMAKE_CXX_FLAGS_INIT "-nostdinc++ -isystem ${RE4_SYSROOT}/usr/include/c++/8 -isystem ${RE4_SYSROOT}/usr/include/aarch64-linux-gnu/c++/8 -isystem ${RE4_SYSROOT}/usr/include/c++/8/backward")
-          set(RE4_LINK "-fuse-ld=lld -B${RE4_GCCDIR} -L${RE4_GCCDIR}")
-          set(CMAKE_EXE_LINKER_FLAGS_INIT "${RE4_LINK}")
-          set(CMAKE_SHARED_LINKER_FLAGS_INIT "${RE4_LINK}")
-          set(CMAKE_MODULE_LINKER_FLAGS_INIT "${RE4_LINK}")
-          set(CMAKE_FIND_ROOT_PATH ${RE4_SYSROOT})
+          set(CMAKE_FIND_ROOT_PATH /opt/sysroot)
           set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
           EOF
 
