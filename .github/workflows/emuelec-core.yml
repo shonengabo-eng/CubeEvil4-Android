@@ -4,6 +4,7 @@ name: EmuELEC core (aarch64, glibc 2.28)
 # libstdc++ hasta GLIBCXX_3.4.25). Usa un sysroot de Debian buster (glibc 2.28,
 # gcc-8) para que los binarios no pidan simbolos mas nuevos que los de la caja.
 # Se lanza a mano: pestana Actions -> "EmuELEC core" -> Run workflow.
+# v4: libgcc_s.so y libstdc++.so creados a mano (ld.lld no encontraba -lgcc_s).
 # v3: desempaqueta a mano los .deb de --include (v2 los dejaba sin abrir).
 # v2: sin --gcc-install-dir (clang no encontraba el GCC del sysroot); rutas
 #     explicitas + diagnostico + prueba rapida antes de la compilacion larga.
@@ -38,7 +39,15 @@ jobs:
           sudo symlinks -cr /opt/sysroot > /dev/null
           echo "== enlaces rotos que quedan =="
           sudo find /opt/sysroot -xtype l | head -20 || true
+          # enlaces de enlazado que Debian pone en libgcc-8-dev / libstdc++-8-dev y que
+          # quedaron rotos: se crean a mano, relativos al sysroot
+          G=/opt/sysroot/usr/lib/gcc/aarch64-linux-gnu/8
+          sudo ln -sfn ../../../aarch64-linux-gnu/libgcc_s.so.1 "$G/libgcc_s.so"
+          sudo ln -sfn ../../../aarch64-linux-gnu/libstdc++.so.6 "$G/libstdc++.so"
+          ls -laL "$G/libgcc_s.so" "$G/libstdc++.so"
           # comprobaciones minimas: si falta algo, fallar aqui y no mas adelante
+          test -e "$G/libgcc_s.so"
+          test -e "$G/libstdc++.so"
           test -f /opt/sysroot/usr/lib/gcc/aarch64-linux-gnu/8/crtbegin.o
           test -f /opt/sysroot/usr/include/c++/8/string
           test -f /opt/sysroot/usr/include/stdio.h
