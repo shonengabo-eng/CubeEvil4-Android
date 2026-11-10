@@ -4,6 +4,7 @@ name: EmuELEC core (aarch64, glibc 2.28)
 # libstdc++ hasta GLIBCXX_3.4.25). Usa un sysroot de Debian buster (glibc 2.28,
 # gcc-8) para que los binarios no pidan simbolos mas nuevos que los de la caja.
 # Se lanza a mano: pestana Actions -> "EmuELEC core" -> Run workflow.
+# v6: enlaces absolutos del sysroot reescritos con python (libm.so estaba roto y lld usaba libm.a).
 # v5: rutas del sysroot dentro de envoltorios /opt/wrap/clang(++) (el plan de enlazado
 #     del proyecto llamaba a clang++ sin ellas y no encontraba crti.o, -lc, -lm...).
 # v4: libgcc_s.so y libstdc++.so creados a mano (ld.lld no encontraba -lgcc_s).
@@ -24,7 +25,7 @@ jobs:
       - name: Herramientas
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang lld cmake ninja-build python3 debootstrap binutils symlinks
+          sudo apt-get install -y clang lld cmake ninja-build python3 debootstrap binutils
 
       - name: Sysroot Debian buster arm64
         run: |
@@ -37,8 +38,28 @@ jobs:
             echo "desempaquetando $d"
             sudo dpkg-deb -x "$d" /opt/sysroot
           done
-          # los enlaces absolutos (/lib/...) apuntarian al sistema del runner: pasarlos a relativos
-          sudo symlinks -cr /opt/sysroot > /dev/null
+          # los enlaces absolutos (/lib/...) apuntan al sistema del runner y no al sysroot:
+          # reescribirlos como relativos DENTRO del sysroot (la herramienta "symlinks" no
+          # lo hace bien: deja libm.so, libdl.so... rotos y lld cae en libm.a, que no es PIC)
+          sudo python3 - <<'PY'
+          import os
+          root = '/opt/sysroot'
+          n = 0
+          for dp, dn, fn in os.walk(root):
+              for name in dn + fn:
+                  p = os.path.join(dp, name)
+                  if not os.path.islink(p):
+                      continue
+                  t = os.readlink(p)
+                  if not os.path.isabs(t):
+                      continue
+                  tgt = os.path.join(root, t.lstrip('/'))
+                  rel = os.path.relpath(tgt, os.path.dirname(p))
+                  os.unlink(p)
+                  os.symlink(rel, p)
+                  n += 1
+          print('enlaces absolutos reescritos:', n)
+          PY
           echo "== enlaces rotos que quedan =="
           sudo find /opt/sysroot -xtype l | head -20 || true
           # enlaces de enlazado que Debian pone en libgcc-8-dev / libstdc++-8-dev y que
@@ -50,6 +71,10 @@ jobs:
           # comprobaciones minimas: si falta algo, fallar aqui y no mas adelante
           test -e "$G/libgcc_s.so"
           test -e "$G/libstdc++.so"
+          L=/opt/sysroot/usr/lib/aarch64-linux-gnu
+          ls -laL "$L/libm.so" "$L/libc.so" "$L/libdl.so" "$L/libpthread.so" || true
+          test -e "$L/libm.so"
+          test -e "$L/libc.so"
           test -f /opt/sysroot/usr/lib/gcc/aarch64-linux-gnu/8/crtbegin.o
           test -f /opt/sysroot/usr/include/c++/8/string
           test -f /opt/sysroot/usr/include/stdio.h
