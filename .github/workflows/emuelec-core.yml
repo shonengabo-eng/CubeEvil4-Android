@@ -4,6 +4,8 @@ name: EmuELEC core (aarch64, glibc 2.28)
 # libstdc++ hasta GLIBCXX_3.4.25). Usa un sysroot de Debian buster (glibc 2.28,
 # gcc-8) para que los binarios no pidan simbolos mas nuevos que los de la caja.
 # Se lanza a mano: pestana Actions -> "EmuELEC core" -> Run workflow.
+# v2: sin --gcc-install-dir (clang no encontraba el GCC del sysroot); rutas
+#     explicitas + diagnostico + prueba rapida antes de la compilacion larga.
 
 on:
   workflow_dispatch:
@@ -24,9 +26,19 @@ jobs:
         run: |
           sudo debootstrap --foreign --no-check-gpg --variant=minbase --arch=arm64 \
             --include=libc6-dev,libgcc-8-dev,libstdc++-8-dev,linux-libc-dev \
-            buster /opt/sysroot http://archive.debian.org/debian
+            buster /opt/sysroot http://archive.debian.org/debian 2>&1 | tail -40
           ls /opt/sysroot/usr/lib/gcc/aarch64-linux-gnu/
-          ls /opt/sysroot/usr/lib/aarch64-linux-gnu | head -30
+
+      - name: Diagnostico del sysroot
+        run: |
+          G=/opt/sysroot/usr/lib/gcc/aarch64-linux-gnu/8
+          echo "== contenido de $G =="
+          ls -la "$G" | head -40
+          echo "== archivos clave =="
+          find /opt/sysroot \( -name 'crtbegin*.o' -o -name 'crt1.o' -o -name 'libc.so*' \
+            -o -name 'libstdc++*' -o -name 'libgcc*' -o -name 'features.h' \) | head -60
+          echo "== cabeceras de C++ =="
+          ls /opt/sysroot/usr/include/c++/ /opt/sysroot/usr/include/aarch64-linux-gnu/c++/ || true
 
       - name: Toolchain de CMake
         run: |
@@ -34,21 +46,54 @@ jobs:
           set(CMAKE_SYSTEM_NAME Linux)
           set(CMAKE_SYSTEM_PROCESSOR aarch64)
           set(RE4_SYSROOT /opt/sysroot)
+          set(RE4_GCCDIR ${RE4_SYSROOT}/usr/lib/gcc/aarch64-linux-gnu/8)
           set(CMAKE_SYSROOT ${RE4_SYSROOT})
           set(CMAKE_C_COMPILER clang)
           set(CMAKE_CXX_COMPILER clang++)
           set(CMAKE_C_COMPILER_TARGET aarch64-linux-gnu)
           set(CMAKE_CXX_COMPILER_TARGET aarch64-linux-gnu)
           set(CMAKE_ASM_COMPILER_TARGET aarch64-linux-gnu)
-          set(RE4_GCCDIR ${RE4_SYSROOT}/usr/lib/gcc/aarch64-linux-gnu/8)
-          set(CMAKE_C_FLAGS_INIT "--gcc-install-dir=${RE4_GCCDIR}")
-          set(CMAKE_CXX_FLAGS_INIT "--gcc-install-dir=${RE4_GCCDIR}")
-          set(CMAKE_EXE_LINKER_FLAGS_INIT "-fuse-ld=lld")
-          set(CMAKE_SHARED_LINKER_FLAGS_INIT "-fuse-ld=lld")
-          set(CMAKE_MODULE_LINKER_FLAGS_INIT "-fuse-ld=lld")
+          # libstdc++ de gcc-8 a mano (sin la deteccion de GCC de clang)
+          set(CMAKE_CXX_FLAGS_INIT "-nostdinc++ -isystem ${RE4_SYSROOT}/usr/include/c++/8 -isystem ${RE4_SYSROOT}/usr/include/aarch64-linux-gnu/c++/8 -isystem ${RE4_SYSROOT}/usr/include/c++/8/backward")
+          set(RE4_LINK "-fuse-ld=lld -B${RE4_GCCDIR} -L${RE4_GCCDIR}")
+          set(CMAKE_EXE_LINKER_FLAGS_INIT "${RE4_LINK}")
+          set(CMAKE_SHARED_LINKER_FLAGS_INIT "${RE4_LINK}")
+          set(CMAKE_MODULE_LINKER_FLAGS_INIT "${RE4_LINK}")
           set(CMAKE_FIND_ROOT_PATH ${RE4_SYSROOT})
           set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
           EOF
+
+      - name: Prueba rapida del compilador (compila y enlaza de verdad)
+        run: |
+          mkdir -p smoke
+          cat > smoke/t.cpp <<'EOF'
+          #include <string>
+          #include <vector>
+          #include <cstdio>
+          int f() {
+            std::vector<std::string> v{"hola"};
+            try { throw 1; } catch (int) { std::printf("%s\n", v[0].c_str()); }
+            return 0;
+          }
+          EOF
+          cat > smoke/m.cpp <<'EOF'
+          int f();
+          int main() { return f(); }
+          EOF
+          cat > smoke/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.20)
+          project(smoke C CXX)
+          add_library(smk SHARED t.cpp)
+          add_executable(smkexe m.cpp)
+          target_link_libraries(smkexe smk)
+          EOF
+          cmake -S smoke -B smoke/build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/emuelec-aarch64.cmake"
+          cmake --build smoke/build -v
+          file smoke/build/smkexe smoke/build/libsmk.so
+          for f in smoke/build/smkexe smoke/build/libsmk.so; do
+            readelf -Ws --dyn-syms "$f" | grep -o -E 'GLIBCXX?_[0-9.]+' | sort -uV | tail -3
+          done
 
       - name: Configurar
         run: |
