@@ -4,6 +4,7 @@ name: EmuELEC core (aarch64, glibc 2.28)
 # libstdc++ hasta GLIBCXX_3.4.25). Usa un sysroot de Debian buster (glibc 2.28,
 # gcc-8) para que los binarios no pidan simbolos mas nuevos que los de la caja.
 # Se lanza a mano: pestana Actions -> "EmuELEC core" -> Run workflow.
+# v7: los envoltorios anaden -lpthread -ldl -lm al enlazar (glibc 2.28 no los trae en libc).
 # v6: enlaces absolutos del sysroot reescritos con python (libm.so estaba roto y lld usaba libm.a).
 # v5: rutas del sysroot dentro de envoltorios /opt/wrap/clang(++) (el plan de enlazado
 #     del proyecto llamaba a clang++ sin ellas y no encontraba crti.o, -lc, -lm...).
@@ -106,8 +107,10 @@ jobs:
           for a in "$@"; do
             case "$a" in -c|-E|-S) link=0 ;; esac
           done
-          if [ $link = 1 ]; then extra+=(-fuse-ld=lld -B$G -L$G); fi
-          exec /usr/bin/clang++ "${extra[@]}" "$@"
+          tail=()
+          # glibc 2.28: pthread_*, dlopen y libm estan en libpthread/libdl/libm (no en libc)
+          if [ $link = 1 ]; then extra+=(-fuse-ld=lld -B$G -L$G); tail=(-lpthread -ldl -lm); fi
+          exec /usr/bin/clang++ "${extra[@]}" "$@" "${tail[@]}"
           EOF
           sudo tee /opt/wrap/clang > /dev/null <<'EOF'
           #!/bin/bash
@@ -118,8 +121,10 @@ jobs:
           for a in "$@"; do
             case "$a" in -c|-E|-S) link=0 ;; esac
           done
-          if [ $link = 1 ]; then extra+=(-fuse-ld=lld -B$G -L$G); fi
-          exec /usr/bin/clang "${extra[@]}" "$@"
+          tail=()
+          # glibc 2.28: pthread_*, dlopen y libm estan en libpthread/libdl/libm (no en libc)
+          if [ $link = 1 ]; then extra+=(-fuse-ld=lld -B$G -L$G); tail=(-lpthread -ldl -lm); fi
+          exec /usr/bin/clang "${extra[@]}" "$@" "${tail[@]}"
           EOF
           sudo chmod +x /opt/wrap/clang /opt/wrap/clang++
           cat > "$GITHUB_WORKSPACE/emuelec-aarch64.cmake" <<'EOF'
