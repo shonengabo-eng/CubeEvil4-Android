@@ -4,6 +4,7 @@ name: EmuELEC core (aarch64, glibc 2.28)
 # libstdc++ hasta GLIBCXX_3.4.25). Usa un sysroot de Debian buster (glibc 2.28,
 # gcc-8) para que los binarios no pidan simbolos mas nuevos que los de la caja.
 # Se lanza a mano: pestana Actions -> "EmuELEC core" -> Run workflow.
+# v3: desempaqueta a mano los .deb de --include (v2 los dejaba sin abrir).
 # v2: sin --gcc-install-dir (clang no encontraba el GCC del sysroot); rutas
 #     explicitas + diagnostico + prueba rapida antes de la compilacion larga.
 
@@ -20,14 +21,28 @@ jobs:
       - name: Herramientas
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang lld cmake ninja-build python3 debootstrap binutils
+          sudo apt-get install -y clang lld cmake ninja-build python3 debootstrap binutils symlinks
 
       - name: Sysroot Debian buster arm64
         run: |
           sudo debootstrap --foreign --no-check-gpg --variant=minbase --arch=arm64 \
             --include=libc6-dev,libgcc-8-dev,libstdc++-8-dev,linux-libc-dev \
-            buster /opt/sysroot http://archive.debian.org/debian 2>&1 | tail -40
-          ls /opt/sysroot/usr/lib/gcc/aarch64-linux-gnu/
+            buster /opt/sysroot http://archive.debian.org/debian 2>&1 | tail -15
+          # --foreign solo desempaqueta la base; los paquetes de --include quedan
+          # descargados como .deb y hay que desempaquetarlos a mano
+          for d in /opt/sysroot/var/cache/apt/archives/*.deb; do
+            echo "desempaquetando $d"
+            sudo dpkg-deb -x "$d" /opt/sysroot
+          done
+          # los enlaces absolutos (/lib/...) apuntarian al sistema del runner: pasarlos a relativos
+          sudo symlinks -cr /opt/sysroot > /dev/null
+          echo "== enlaces rotos que quedan =="
+          sudo find /opt/sysroot -xtype l | head -20 || true
+          # comprobaciones minimas: si falta algo, fallar aqui y no mas adelante
+          test -f /opt/sysroot/usr/lib/gcc/aarch64-linux-gnu/8/crtbegin.o
+          test -f /opt/sysroot/usr/include/c++/8/string
+          test -f /opt/sysroot/usr/include/stdio.h
+          test -f /opt/sysroot/usr/lib/aarch64-linux-gnu/crt1.o
 
       - name: Diagnostico del sysroot
         run: |
