@@ -4,6 +4,7 @@ name: EmuELEC core (aarch64, glibc 2.28)
 # libstdc++ hasta GLIBCXX_3.4.25). Usa un sysroot de Debian buster (glibc 2.28,
 # gcc-8) para que los binarios no pidan simbolos mas nuevos que los de la caja.
 # Se lanza a mano: pestana Actions -> "EmuELEC core" -> Run workflow.
+# v8: el paso de reunir el resultado fallaba por un 'Permission denied' de find; ccache anadido.
 # v7: los envoltorios anaden -lpthread -ldl -lm al enlazar (glibc 2.28 no los trae en libc).
 # v6: enlaces absolutos del sysroot reescritos con python (libm.so estaba roto y lld usaba libm.a).
 # v5: rutas del sysroot dentro de envoltorios /opt/wrap/clang(++) (el plan de enlazado
@@ -26,7 +27,7 @@ jobs:
       - name: Herramientas
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang lld cmake ninja-build python3 debootstrap binutils
+          sudo apt-get install -y clang lld cmake ninja-build python3 debootstrap binutils ccache
 
       - name: Sysroot Debian buster arm64
         run: |
@@ -172,24 +173,40 @@ jobs:
             readelf -Ws --dyn-syms "$f" | grep -o -E 'GLIBCXX?_[0-9.]+' | sort -uV | tail -3
           done
 
+      - name: Cache del compilador (ccache)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ github.sha }}
+          restore-keys: ccache-
+
       - name: Configurar
+        env:
+          CCACHE_COMPILERCHECK: content
+          CCACHE_MAXSIZE: 1500M
         run: |
           set -o pipefail
           cmake -S port/whole -B build -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/emuelec-aarch64.cmake" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DRE4_OPT_LEVEL=2 2>&1 | tee configure.log
 
       - name: Compilar
+        env:
+          CCACHE_COMPILERCHECK: content
+          CCACHE_MAXSIZE: 1500M
         run: |
           set -o pipefail
           cmake --build build -j"$(nproc)" 2>&1 | tee build.log
+          ccache -s | head -12
 
       - name: Reunir resultado
         run: |
           mkdir -p out
           find build -type f \( -name 'libre4_*.so*' -o -name 're4_host' \) -exec cp -v {} out/ \;
-          find /opt/sysroot -name 'libstdc++.so.6*' -exec cp -av {} out/ \;
-          find /opt/sysroot -name 'libgcc_s.so.1' -exec cp -av {} out/ \;
+          # librerias de C++ y gcc del sysroot (gcc-8): el port las lleva consigo
+          cp -av /opt/sysroot/usr/lib/aarch64-linux-gnu/libstdc++.so.6* out/
+          cp -av /opt/sysroot/usr/lib/aarch64-linux-gnu/libgcc_s.so.1 out/
           ls -la out | head -200
 
       - name: Comprobar versiones de glibc y libstdc++
