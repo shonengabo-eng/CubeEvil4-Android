@@ -4,6 +4,7 @@ name: EmuELEC core (aarch64, glibc 2.28)
 # libstdc++ hasta GLIBCXX_3.4.25). Usa un sysroot de Debian buster (glibc 2.28,
 # gcc-8) para que los binarios no pidan simbolos mas nuevos que los de la caja.
 # Se lanza a mano: pestana Actions -> "EmuELEC core" -> Run workflow.
+# v9: carpeta out/ con la misma estructura que espera re4_host (modules/) + probar.sh.
 # v8: el paso de reunir el resultado fallaba por un 'Permission denied' de find; ccache anadido.
 # v7: los envoltorios anaden -lpthread -ldl -lm al enlazar (glibc 2.28 no los trae en libc).
 # v6: enlaces absolutos del sysroot reescritos con python (libm.so estaba roto y lld usaba libm.a).
@@ -202,22 +203,42 @@ jobs:
 
       - name: Reunir resultado
         run: |
-          mkdir -p out
-          find build -type f \( -name 'libre4_*.so*' -o -name 're4_host' \) -exec cp -v {} out/ \;
+          # re4_host busca los modulos del juego en <carpeta de re4_host>/modules
+          mkdir -p out/modules
+          find build -maxdepth 1 -type f \( -name 'libre4_*.so*' -o -name 're4_host' \) -exec cp -v {} out/ \;
+          find build/modules -type f -name 'libre4_*.so' -exec cp -v {} out/modules/ \;
           # librerias de C++ y gcc del sysroot (gcc-8): el port las lleva consigo
           cp -av /opt/sysroot/usr/lib/aarch64-linux-gnu/libstdc++.so.6* out/
           cp -av /opt/sysroot/usr/lib/aarch64-linux-gnu/libgcc_s.so.1 out/
-          ls -la out | head -200
+          cat > out/probar.sh <<'EOF'
+          #!/bin/bash
+          # Prueba en la caja: carga el nucleo y los modulos (no necesita discos).
+          # Copia esta carpeta a la caja y ejecuta este script (por SSH o desde Ports).
+          cd "$(dirname "$0")" || exit 1
+          chmod +x re4_host probar.sh 2>/dev/null
+          export LD_LIBRARY_PATH="$PWD:$LD_LIBRARY_PATH"
+          {
+            echo "== fecha: $(date)"; uname -a; free -m | head -2
+            echo "== self-test ==";      ./re4_host --self-test;      echo "codigo: $?"
+            echo "== runtime-test ==";   ./re4_host --runtime-test;   echo "codigo: $?"
+            echo "== check-modules =="; ./re4_host --check-modules;  echo "codigo: $?"
+          } 2>&1 | tee probar.log
+          EOF
+          chmod +x out/probar.sh
+          find out -type f | sort | head -300
+          du -sh out
 
       - name: Comprobar versiones de glibc y libstdc++
         run: |
           cd out
           echo "== GLIBC maximo pedido (la caja tiene 2.29) =="
-          for f in *.so* re4_host; do
-            [ -f "$f" ] && readelf -Ws --dyn-syms "$f" 2>/dev/null | grep -o 'GLIBC_[0-9.]*' ; done | sort -uV | tail -3
+          find . -type f \( -name '*.so*' -o -name re4_host \) | while read -r f; do
+            readelf -Ws --dyn-syms "$f" 2>/dev/null | grep -o 'GLIBC_[0-9.]*'; done | sort -uV | tail -3
           echo "== GLIBCXX maximo pedido (la caja llega a 3.4.25) =="
-          for f in *.so* re4_host; do
-            [ -f "$f" ] && readelf -Ws --dyn-syms "$f" 2>/dev/null | grep -o 'GLIBCXX_[0-9.]*' ; done | sort -uV | tail -3
+          find . -type f \( -name '*.so*' -o -name re4_host \) | while read -r f; do
+            readelf -Ws --dyn-syms "$f" 2>/dev/null | grep -o 'GLIBCXX_[0-9.]*'; done | sort -uV | tail -3
+          echo "== librerias que pide el nucleo =="
+          readelf -d libre4_main.so re4_host libre4_host.so 2>/dev/null | grep -E "NEEDED|RUNPATH|RPATH|File:" || true
 
       - uses: actions/upload-artifact@v4
         with:
