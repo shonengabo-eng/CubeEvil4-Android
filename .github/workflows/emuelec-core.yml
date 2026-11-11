@@ -4,6 +4,7 @@ name: EmuELEC core (aarch64, glibc 2.28)
 # libstdc++ hasta GLIBCXX_3.4.25). Usa un sysroot de Debian buster (glibc 2.28,
 # gcc-8) para que los binarios no pidan simbolos mas nuevos que los de la caja.
 # Se lanza a mano: pestana Actions -> "EmuELEC core" -> Run workflow.
+# v10: anade el frontend re4_emu (SDL2 + GLES: ventana, mando y menu) compilado antes del nucleo.
 # v9: carpeta out/ con la misma estructura que espera re4_host (modules/) + probar.sh.
 # v8: el paso de reunir el resultado fallaba por un 'Permission denied' de find; ccache anadido.
 # v7: los envoltorios anaden -lpthread -ldl -lm al enlazar (glibc 2.28 no los trae en libc).
@@ -174,6 +175,835 @@ jobs:
             readelf -Ws --dyn-syms "$f" | grep -o -E 'GLIBCXX?_[0-9.]+' | sort -uV | tail -3
           done
 
+      - name: SDL2 de Debian buster (cabeceras y libreria para enlazar)
+        run: |
+          # la caja usa SDL2 2.0.9: se compila contra las cabeceras de SDL2 2.0.9 de Debian buster
+          base=http://archive.debian.org/debian/pool/main/libs/libsdl2
+          curl -fsSL "$base/" -o sdl_index.html
+          dev=$(grep -o 'libsdl2-dev_2\.0\.9[^"<>]*_arm64\.deb' sdl_index.html | sort -u | tail -1)
+          rt=$(grep -o 'libsdl2-2\.0-0_2\.0\.9[^"<>]*_arm64\.deb' sdl_index.html | sort -u | tail -1)
+          echo "paquetes: [$dev] [$rt]"
+          test -n "$dev"
+          test -n "$rt"
+          curl -fsSL -O "$base/$dev"
+          curl -fsSL -O "$base/$rt"
+          sudo mkdir -p /opt/sdl2dev
+          sudo dpkg-deb -x "$dev" /opt/sdl2dev
+          sudo dpkg-deb -x "$rt" /opt/sdl2dev
+          ls -la /opt/sdl2dev/usr/lib/aarch64-linux-gnu/ | head -20
+          test -f /opt/sdl2dev/usr/include/SDL2/SDL.h
+          test -e /opt/sdl2dev/usr/lib/aarch64-linux-gnu/libSDL2-2.0.so.0
+
+      - name: Compilar el frontend (re4_emu)
+        run: |
+          mkdir -p emu out
+          cat > emu/font_data.h <<'RE4_EMU_SRC_END'
+          // Fuente 8x16 de 1 bit generada con DejaVu Sans Mono Bold (licencia libre de Bitstream Vera/DejaVu).
+          // Un glifo = 16 bytes (una fila por byte, el bit alto es el pixel de la izquierda).
+          static const int kFontCount = 112;
+          static const unsigned kFontCodes[112] = {32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,225,233,237,243,250,252,241,193,201,205,211,218,220,209,161,191,176};
+          static const unsigned char kFontBits[112][16] = {
+            {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x18,0x18,0x18,0x18,0x18,0x18,0x00,0x18,0x18,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x66,0x66,0x66,0x66,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x00,0x12,0x16,0x7f,0x34,0x24,0xfe,0x68,0x48,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x08,0x08,0x3e,0x6a,0x68,0x3e,0x0b,0x0b,0x6b,0x3e,0x08,0x08,0x00,0x00},
+            {0x00,0x00,0x00,0x60,0x90,0x90,0x63,0x1c,0xe6,0x09,0x09,0x06,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x1c,0x30,0x30,0x18,0x39,0x6d,0x67,0x66,0x3f,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x18,0x18,0x18,0x18,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+            {0x00,0x08,0x18,0x10,0x30,0x30,0x30,0x30,0x30,0x30,0x10,0x18,0x08,0x00,0x00,0x00},
+            {0x00,0x10,0x18,0x08,0x0c,0x0c,0x0c,0x0c,0x0c,0x0c,0x08,0x18,0x10,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x10,0xd6,0x7c,0x7c,0xd6,0x10,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x00,0x18,0x18,0x18,0xff,0xff,0x18,0x18,0x18,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x18,0x18,0x10,0x20,0x00,0x00},
+            {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x3c,0x3c,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x18,0x18,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x02,0x04,0x04,0x08,0x08,0x18,0x10,0x10,0x20,0x20,0x40,0x00,0x00},
+            {0x00,0x00,0x00,0x1c,0x36,0x63,0x6b,0x6b,0x63,0x63,0x36,0x1c,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x78,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x7e,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x3e,0x43,0x03,0x02,0x06,0x0c,0x18,0x30,0x7f,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x3e,0x43,0x03,0x1c,0x07,0x03,0x03,0x47,0x3e,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x0e,0x0e,0x1e,0x36,0x66,0x7f,0x06,0x06,0x06,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x7e,0x60,0x60,0x7c,0x47,0x03,0x03,0x47,0x3c,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x1c,0x32,0x60,0x7e,0x63,0x63,0x63,0x23,0x1e,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x7f,0x03,0x06,0x06,0x0c,0x0c,0x18,0x18,0x30,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x3e,0x63,0x63,0x1c,0x63,0x63,0x63,0x63,0x3e,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x3c,0x62,0x63,0x63,0x63,0x3f,0x03,0x26,0x1c,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x00,0x00,0x18,0x18,0x00,0x00,0x00,0x18,0x18,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x00,0x00,0x18,0x18,0x00,0x00,0x00,0x18,0x18,0x10,0x20,0x00,0x00},
+            {0x00,0x00,0x00,0x00,0x00,0x01,0x0f,0x3c,0x60,0x3c,0x0f,0x01,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x00,0x00,0x00,0x7f,0x7f,0x00,0x7f,0x7f,0x00,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x00,0x00,0x40,0x78,0x1e,0x03,0x1e,0x78,0x40,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x1c,0x26,0x06,0x0c,0x18,0x18,0x00,0x18,0x18,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x3c,0x62,0x5e,0xb6,0xa2,0xa2,0xa2,0xb6,0x5e,0x62,0x3e,0x00,0x00},
+            {0x00,0x00,0x00,0x1c,0x1c,0x14,0x36,0x36,0x3e,0x36,0x63,0x63,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x7e,0x63,0x63,0x63,0x7c,0x63,0x63,0x63,0x7e,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x1e,0x31,0x60,0x60,0x60,0x60,0x60,0x31,0x1e,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x7c,0x66,0x63,0x63,0x63,0x63,0x63,0x66,0x7c,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x7f,0x60,0x60,0x60,0x7e,0x60,0x60,0x60,0x7f,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x7f,0x60,0x60,0x60,0x7e,0x60,0x60,0x60,0x60,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x1e,0x31,0x60,0x60,0x67,0x63,0x63,0x33,0x1f,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x63,0x63,0x63,0x63,0x7f,0x63,0x63,0x63,0x63,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x7e,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x7e,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x0f,0x03,0x03,0x03,0x03,0x03,0x03,0x43,0x3e,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x63,0x66,0x6c,0x78,0x7c,0x6c,0x66,0x66,0x63,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x60,0x60,0x60,0x60,0x60,0x60,0x60,0x60,0x7f,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x77,0x77,0x77,0x77,0x7f,0x6b,0x63,0x63,0x63,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x73,0x73,0x73,0x7b,0x6b,0x6f,0x67,0x67,0x67,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x1c,0x36,0x63,0x63,0x63,0x63,0x63,0x36,0x1c,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x7e,0x63,0x63,0x63,0x63,0x7e,0x60,0x60,0x60,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x1c,0x36,0x63,0x63,0x63,0x63,0x63,0x36,0x1e,0x06,0x02,0x00,0x00},
+            {0x00,0x00,0x00,0x7e,0x63,0x63,0x63,0x63,0x7c,0x66,0x63,0x61,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x3e,0x61,0x60,0x70,0x3e,0x07,0x03,0x43,0x3e,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x7e,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x63,0x63,0x63,0x63,0x63,0x63,0x63,0x63,0x3e,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x63,0x63,0x22,0x36,0x36,0x36,0x14,0x1c,0x1c,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0xc3,0xc3,0xdb,0xdb,0x5a,0x5e,0x66,0x66,0x66,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x63,0x36,0x36,0x1c,0x08,0x1c,0x36,0x36,0x63,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0xc3,0x66,0x66,0x3c,0x3c,0x18,0x18,0x18,0x18,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x7f,0x03,0x06,0x0c,0x1c,0x18,0x30,0x60,0x7f,0x00,0x00,0x00,0x00},
+            {0x00,0x1e,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x1e,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x60,0x20,0x20,0x30,0x10,0x18,0x08,0x0c,0x04,0x04,0x06,0x00,0x00},
+            {0x00,0x38,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x38,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x38,0x38,0x6c,0xc6,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xff,0x00},
+            {0x00,0x00,0x30,0x18,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x00,0x00,0x1c,0x26,0x06,0x3e,0x66,0x66,0x3e,0x00,0x00,0x00,0x00},
+            {0x00,0x60,0x60,0x60,0x60,0x7c,0x66,0x66,0x66,0x66,0x66,0x7c,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x00,0x00,0x1c,0x32,0x60,0x60,0x60,0x32,0x1c,0x00,0x00,0x00,0x00},
+            {0x00,0x06,0x06,0x06,0x06,0x3e,0x66,0x66,0x66,0x66,0x66,0x3e,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x00,0x00,0x3c,0x66,0x66,0x7e,0x60,0x62,0x3c,0x00,0x00,0x00,0x00},
+            {0x00,0x0e,0x18,0x18,0x18,0x7e,0x18,0x18,0x18,0x18,0x18,0x18,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x00,0x00,0x3e,0x66,0x66,0x66,0x66,0x66,0x3e,0x06,0x06,0x3c,0x00},
+            {0x00,0x60,0x60,0x60,0x60,0x7c,0x66,0x66,0x66,0x66,0x66,0x66,0x00,0x00,0x00,0x00},
+            {0x00,0x18,0x18,0x00,0x00,0x78,0x18,0x18,0x18,0x18,0x18,0x7e,0x00,0x00,0x00,0x00},
+            {0x00,0x0c,0x0c,0x00,0x00,0x3c,0x0c,0x0c,0x0c,0x0c,0x0c,0x0c,0x0c,0x0c,0x78,0x00},
+            {0x00,0x60,0x60,0x60,0x60,0x64,0x6c,0x78,0x78,0x6c,0x6c,0x66,0x00,0x00,0x00,0x00},
+            {0x00,0xf0,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x1e,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x00,0x00,0xff,0xdb,0xdb,0xdb,0xdb,0xdb,0xdb,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x00,0x00,0x7c,0x66,0x66,0x66,0x66,0x66,0x66,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x00,0x00,0x3c,0x66,0x66,0x66,0x66,0x66,0x3c,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x00,0x00,0x7c,0x66,0x66,0x66,0x66,0x66,0x7c,0x60,0x60,0x60,0x00},
+            {0x00,0x00,0x00,0x00,0x00,0x3e,0x66,0x66,0x66,0x66,0x66,0x3e,0x06,0x06,0x06,0x00},
+            {0x00,0x00,0x00,0x00,0x00,0x3e,0x30,0x30,0x30,0x30,0x30,0x30,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x00,0x00,0x3c,0x62,0x70,0x3c,0x06,0x46,0x3c,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x18,0x18,0x7e,0x18,0x18,0x18,0x18,0x18,0x0e,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x00,0x00,0x66,0x66,0x66,0x66,0x66,0x66,0x3e,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x00,0x00,0x66,0x66,0x24,0x3c,0x3c,0x18,0x18,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x00,0x00,0xc3,0xc3,0xdb,0x5a,0x5a,0x66,0x66,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x00,0x00,0x66,0x3c,0x18,0x18,0x3c,0x3c,0x66,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x00,0x00,0x66,0x66,0x2c,0x3c,0x3c,0x18,0x18,0x18,0x30,0x70,0x00},
+            {0x00,0x00,0x00,0x00,0x00,0x7e,0x06,0x0c,0x18,0x30,0x60,0x7e,0x00,0x00,0x00,0x00},
+            {0x00,0x0e,0x18,0x18,0x18,0x18,0x18,0x60,0x18,0x18,0x18,0x18,0x1e,0x00,0x00,0x00},
+            {0x00,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x00,0x00},
+            {0x00,0x70,0x18,0x18,0x18,0x18,0x18,0x06,0x18,0x18,0x18,0x18,0x78,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x00,0x00,0x00,0x39,0x46,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x0c,0x18,0x00,0x1c,0x26,0x06,0x3e,0x66,0x66,0x3e,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x0c,0x18,0x00,0x3c,0x66,0x66,0x7e,0x60,0x62,0x3c,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x0c,0x18,0x00,0x78,0x18,0x18,0x18,0x18,0x18,0x7e,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x0c,0x18,0x00,0x3c,0x66,0x66,0x66,0x66,0x66,0x3c,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x0c,0x18,0x00,0x66,0x66,0x66,0x66,0x66,0x66,0x3e,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x66,0x66,0x00,0x66,0x66,0x66,0x66,0x66,0x66,0x3e,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x34,0x2c,0x00,0x7c,0x66,0x66,0x66,0x66,0x66,0x66,0x00,0x00,0x00,0x00},
+            {0x0c,0x18,0x00,0x1c,0x1c,0x14,0x36,0x36,0x3e,0x36,0x63,0x63,0x00,0x00,0x00,0x00},
+            {0x0c,0x18,0x00,0x7f,0x60,0x60,0x60,0x7e,0x60,0x60,0x60,0x7f,0x00,0x00,0x00,0x00},
+            {0x0c,0x18,0x00,0x7e,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x7e,0x00,0x00,0x00,0x00},
+            {0x0c,0x18,0x00,0x1c,0x36,0x63,0x63,0x63,0x63,0x63,0x36,0x1c,0x00,0x00,0x00,0x00},
+            {0x0c,0x18,0x00,0x63,0x63,0x63,0x63,0x63,0x63,0x63,0x63,0x3e,0x00,0x00,0x00,0x00},
+            {0x36,0x36,0x00,0x63,0x63,0x63,0x63,0x63,0x63,0x63,0x63,0x3e,0x00,0x00,0x00,0x00},
+            {0x3a,0x2e,0x00,0x73,0x73,0x73,0x7b,0x6b,0x6f,0x67,0x67,0x67,0x00,0x00,0x00,0x00},
+            {0x00,0x00,0x00,0x00,0x00,0x18,0x18,0x00,0x18,0x18,0x18,0x18,0x18,0x18,0x00,0x00},
+            {0x00,0x00,0x00,0x00,0x00,0x18,0x18,0x00,0x18,0x18,0x18,0x30,0x60,0x64,0x38,0x00},
+            {0x00,0x00,0x00,0x18,0x24,0x24,0x18,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+          };
+          RE4_EMU_SRC_END
+          cat > emu/re4_emu.cpp <<'RE4_EMU_SRC_END'
+          // re4_emu.cpp - CubeEvil4 para EmuELEC (Amlogic aarch64, SDL2 del sistema + OpenGL ES).
+          // Etapa 2a: ventana a pantalla completa, mando(s) conectado(s) y menu propio del port.
+          // Todavia no carga el nucleo del juego: sirve para comprobar video, GLES y mando en la caja.
+          //
+          // Mando:  SELECT (pulsar)        abre/cierra el menu del port (como el menu de la app Android)
+          //         SELECT (mantener 1 s)  menu de depuracion del juego (solo discos debug; aun no conectado)
+          //         R3                     abre/cierra el menu (acceso directo)
+          //         SELECT+START (1,5 s)   salir      (tambien Hotkey/GUIDE+START)
+          // Teclado (pruebas en PC): flechas, Intro=A, Esc/Retroceso=B, Tab=SELECT, Espacio=START, F2=R3.
+          //
+          // Variables de entorno (diagnostico):
+          //   RE4_EMU_WINDOWED=1        ventana de 1280x720 en vez de pantalla completa
+          //   RE4_EMU_TEST_SECONDS=N    sale solo despues de N segundos
+          //   RE4_EMU_SHOT=ruta.bmp     guarda una captura (cuadro RE4_EMU_SHOT_FRAME, por defecto 45)
+          //   RE4_EMU_AUTOMENU=1        abre el menu solo (para la captura)
+
+          #include <SDL.h>
+          #include <algorithm>
+          #include <cmath>
+          #include <cstdint>
+          #include <cstdio>
+          #include <cstdlib>
+          #include <cstring>
+          #include <string>
+          #include <vector>
+
+          #include "font_data.h"
+
+          // ---------------------------------------------------------------------------------------------
+          // OpenGL ES minimo: sin cabeceras de GL, las funciones se piden a SDL (asi no hace falta enlazar
+          // libGLESv2 al compilar y se usa la libGLESv2/libMali de la caja).
+          // ---------------------------------------------------------------------------------------------
+          typedef unsigned int GLenum, GLuint, GLbitfield;
+          typedef int GLint, GLsizei;
+          typedef float GLfloat;
+          typedef char GLchar;
+          typedef unsigned char GLboolean;
+          typedef ptrdiff_t GLsizeiptr;
+
+          enum : unsigned {
+              GL_COLOR_BUFFER_BIT = 0x4000, GL_TRIANGLES = 0x0004, GL_FLOAT = 0x1406, GL_UNSIGNED_BYTE = 0x1401,
+              GL_TEXTURE_2D = 0x0DE1, GL_RGBA = 0x1908, GL_TEXTURE_MIN_FILTER = 0x2801, GL_TEXTURE_MAG_FILTER = 0x2800,
+              GL_NEAREST = 0x2600, GL_CLAMP_TO_EDGE = 0x812F, GL_TEXTURE_WRAP_S = 0x2802, GL_TEXTURE_WRAP_T = 0x2803,
+              GL_VERTEX_SHADER = 0x8B31, GL_FRAGMENT_SHADER = 0x8B30, GL_COMPILE_STATUS = 0x8B81, GL_LINK_STATUS = 0x8B82,
+              GL_INFO_LOG_LENGTH = 0x8B84, GL_ARRAY_BUFFER = 0x8892, GL_STREAM_DRAW = 0x88E0, GL_BLEND = 0x0BE2,
+              GL_SRC_ALPHA = 0x0302, GL_ONE_MINUS_SRC_ALPHA = 0x0303, GL_TEXTURE0 = 0x84C0, GL_VENDOR = 0x1F00,
+              GL_RENDERER = 0x1F01, GL_VERSION = 0x1F02, GL_SHADING_LANGUAGE_VERSION = 0x8B8C, GL_DEPTH_TEST = 0x0B71,
+              GL_UNPACK_ALIGNMENT = 0x0CF5, GL_PACK_ALIGNMENT = 0x0D05, GL_CULL_FACE = 0x0B44, GL_SCISSOR_TEST = 0x0C11
+          };
+
+          #define GLFN(ret, name, ...) \
+              typedef ret (*name##_t)(__VA_ARGS__); \
+              static name##_t name = nullptr;
+          GLFN(void, glClear, GLbitfield)
+          GLFN(void, glClearColor, GLfloat, GLfloat, GLfloat, GLfloat)
+          GLFN(void, glViewport, GLint, GLint, GLsizei, GLsizei)
+          GLFN(void, glEnable, GLenum)
+          GLFN(void, glDisable, GLenum)
+          GLFN(void, glBlendFunc, GLenum, GLenum)
+          GLFN(const unsigned char *, glGetString, GLenum)
+          GLFN(GLuint, glCreateShader, GLenum)
+          GLFN(void, glShaderSource, GLuint, GLsizei, const GLchar *const *, const GLint *)
+          GLFN(void, glCompileShader, GLuint)
+          GLFN(void, glGetShaderiv, GLuint, GLenum, GLint *)
+          GLFN(void, glGetShaderInfoLog, GLuint, GLsizei, GLsizei *, GLchar *)
+          GLFN(GLuint, glCreateProgram, void)
+          GLFN(void, glAttachShader, GLuint, GLuint)
+          GLFN(void, glBindAttribLocation, GLuint, GLuint, const GLchar *)
+          GLFN(void, glLinkProgram, GLuint)
+          GLFN(void, glGetProgramiv, GLuint, GLenum, GLint *)
+          GLFN(void, glGetProgramInfoLog, GLuint, GLsizei, GLsizei *, GLchar *)
+          GLFN(void, glUseProgram, GLuint)
+          GLFN(GLint, glGetUniformLocation, GLuint, const GLchar *)
+          GLFN(void, glUniform2f, GLint, GLfloat, GLfloat)
+          GLFN(void, glUniform1i, GLint, GLint)
+          GLFN(void, glEnableVertexAttribArray, GLuint)
+          GLFN(void, glVertexAttribPointer, GLuint, GLint, GLenum, GLboolean, GLsizei, const void *)
+          GLFN(void, glGenBuffers, GLsizei, GLuint *)
+          GLFN(void, glBindBuffer, GLenum, GLuint)
+          GLFN(void, glBufferData, GLenum, GLsizeiptr, const void *, GLenum)
+          GLFN(void, glDrawArrays, GLenum, GLint, GLsizei)
+          GLFN(void, glGenTextures, GLsizei, GLuint *)
+          GLFN(void, glBindTexture, GLenum, GLuint)
+          GLFN(void, glTexImage2D, GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *)
+          GLFN(void, glTexParameteri, GLenum, GLenum, GLint)
+          GLFN(void, glActiveTexture, GLenum)
+          GLFN(void, glPixelStorei, GLenum, GLint)
+          GLFN(void, glReadPixels, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *)
+
+          static bool loadGL()
+          {
+              bool ok = true;
+          #define LOAD(n) do { n = (n##_t)SDL_GL_GetProcAddress(#n); if (!n) { std::fprintf(stderr, "[gl] falta %s\n", #n); ok = false; } } while (0)
+              LOAD(glClear); LOAD(glClearColor); LOAD(glViewport); LOAD(glEnable); LOAD(glDisable); LOAD(glBlendFunc);
+              LOAD(glGetString); LOAD(glCreateShader); LOAD(glShaderSource); LOAD(glCompileShader); LOAD(glGetShaderiv);
+              LOAD(glGetShaderInfoLog); LOAD(glCreateProgram); LOAD(glAttachShader); LOAD(glBindAttribLocation);
+              LOAD(glLinkProgram); LOAD(glGetProgramiv); LOAD(glGetProgramInfoLog); LOAD(glUseProgram);
+              LOAD(glGetUniformLocation); LOAD(glUniform2f); LOAD(glUniform1i); LOAD(glEnableVertexAttribArray);
+              LOAD(glVertexAttribPointer); LOAD(glGenBuffers); LOAD(glBindBuffer); LOAD(glBufferData); LOAD(glDrawArrays);
+              LOAD(glGenTextures); LOAD(glBindTexture); LOAD(glTexImage2D); LOAD(glTexParameteri); LOAD(glActiveTexture);
+              LOAD(glPixelStorei); LOAD(glReadPixels);
+          #undef LOAD
+              return ok;
+          }
+
+          // ---------------------------------------------------------------------------------------------
+          // Dibujo 2D (texto y rectangulos) sobre un lienzo virtual de 640x360
+          // ---------------------------------------------------------------------------------------------
+          static const float kCanvasW = 640.0f, kCanvasH = 360.0f;
+          static const int kAtlasW = 128, kAtlasH = 128, kSolidCell = 127;
+
+          struct Col { unsigned char r, g, b, a; };
+          struct Vtx { float x, y, u, v; unsigned char r, g, b, a; };
+
+          static GLuint gProg = 0, gVbo = 0, gTex = 0;
+          static GLint gUScreen = -1, gUTex = -1;
+          static std::vector<Vtx> gVerts;
+
+          static GLuint compile(GLenum type, const char *src)
+          {
+              GLuint s = glCreateShader(type);
+              glShaderSource(s, 1, &src, nullptr);
+              glCompileShader(s);
+              GLint ok = 0;
+              glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+              if (!ok) {
+                  char log[1024] = {0};
+                  glGetShaderInfoLog(s, sizeof(log) - 1, nullptr, log);
+                  std::fprintf(stderr, "[gl] error de shader: %s\n", log);
+                  return 0;
+              }
+              return s;
+          }
+
+          static bool initDraw()
+          {
+              const char *vs =
+                  "#version 100\n"
+                  "attribute vec2 aPos; attribute vec2 aUV; attribute vec4 aCol;\n"
+                  "uniform vec2 uScreen; varying vec2 vUV; varying vec4 vCol;\n"
+                  "void main() { vUV = aUV; vCol = aCol;\n"
+                  "  gl_Position = vec4(aPos.x / uScreen.x * 2.0 - 1.0, 1.0 - aPos.y / uScreen.y * 2.0, 0.0, 1.0); }\n";
+              const char *fs =
+                  "#version 100\n"
+                  "precision mediump float;\n"
+                  "uniform sampler2D uTex; varying vec2 vUV; varying vec4 vCol;\n"
+                  "void main() { gl_FragColor = vec4(vCol.rgb, vCol.a * texture2D(uTex, vUV).a); }\n";
+              GLuint v = compile(GL_VERTEX_SHADER, vs), f = compile(GL_FRAGMENT_SHADER, fs);
+              if (!v || !f) return false;
+              gProg = glCreateProgram();
+              glAttachShader(gProg, v);
+              glAttachShader(gProg, f);
+              glBindAttribLocation(gProg, 0, "aPos");
+              glBindAttribLocation(gProg, 1, "aUV");
+              glBindAttribLocation(gProg, 2, "aCol");
+              glLinkProgram(gProg);
+              GLint ok = 0;
+              glGetProgramiv(gProg, GL_LINK_STATUS, &ok);
+              if (!ok) {
+                  char log[1024] = {0};
+                  glGetProgramInfoLog(gProg, sizeof(log) - 1, nullptr, log);
+                  std::fprintf(stderr, "[gl] error al enlazar: %s\n", log);
+                  return false;
+              }
+              gUScreen = glGetUniformLocation(gProg, "uScreen");
+              gUTex = glGetUniformLocation(gProg, "uTex");
+
+              // atlas RGBA (blanco con alfa = cobertura del glifo); celda 127 = bloque solido
+              std::vector<unsigned char> img(kAtlasW * kAtlasH * 4, 0);
+              for (int i = 0; i < kFontCount; i++) {
+                  int cx = (i % 16) * 8, cy = (i / 16) * 16;
+                  for (int y = 0; y < 16; y++)
+                      for (int x = 0; x < 8; x++) {
+                          bool on = (kFontBits[i][y] & (0x80 >> x)) != 0;
+                          unsigned char *p = &img[((cy + y) * kAtlasW + cx + x) * 4];
+                          p[0] = p[1] = p[2] = 255;
+                          p[3] = on ? 255 : 0;
+                      }
+              }
+              {
+                  int cx = (kSolidCell % 16) * 8, cy = (kSolidCell / 16) * 16;
+                  for (int y = 0; y < 16; y++)
+                      for (int x = 0; x < 8; x++) {
+                          unsigned char *p = &img[((cy + y) * kAtlasW + cx + x) * 4];
+                          p[0] = p[1] = p[2] = p[3] = 255;
+                      }
+              }
+              glGenTextures(1, &gTex);
+              glBindTexture(GL_TEXTURE_2D, gTex);
+              glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+              glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, kAtlasW, kAtlasH, 0, GL_RGBA, GL_UNSIGNED_BYTE, img.data());
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+              glGenBuffers(1, &gVbo);
+              return true;
+          }
+
+          static void quad(float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, Col c)
+          {
+              Vtx a = {x0, y0, u0, v0, c.r, c.g, c.b, c.a}, b = {x1, y0, u1, v0, c.r, c.g, c.b, c.a};
+              Vtx d = {x1, y1, u1, v1, c.r, c.g, c.b, c.a}, e = {x0, y1, u0, v1, c.r, c.g, c.b, c.a};
+              gVerts.push_back(a); gVerts.push_back(b); gVerts.push_back(d);
+              gVerts.push_back(a); gVerts.push_back(d); gVerts.push_back(e);
+          }
+
+          static void rect(float x, float y, float w, float h, Col c)
+          {
+              float u = ((kSolidCell % 16) * 8 + 4) / (float)kAtlasW, v = ((kSolidCell / 16) * 16 + 8) / (float)kAtlasH;
+              quad(x, y, x + w, y + h, u, v, u, v, c);
+          }
+
+          static int glyphIndex(unsigned cp)
+          {
+              for (int i = 0; i < kFontCount; i++)
+                  if (kFontCodes[i] == cp) return i;
+              return '?' - 32;
+          }
+
+          // decodifica UTF-8 (solo hasta 3 bytes, suficiente para este menu)
+          static unsigned nextCp(const char *&s)
+          {
+              unsigned char c = (unsigned char)*s++;
+              if (c < 0x80) return c;
+              if ((c & 0xE0) == 0xC0 && *s) { unsigned r = ((c & 0x1F) << 6) | ((unsigned char)*s++ & 0x3F); return r; }
+              if ((c & 0xF0) == 0xE0 && s[0] && s[1]) {
+                  unsigned r = ((c & 0x0F) << 12) | (((unsigned char)s[0] & 0x3F) << 6) | ((unsigned char)s[1] & 0x3F);
+                  s += 2;
+                  return r;
+              }
+              return '?';
+          }
+
+          [[maybe_unused]] static float textW(const std::string &str, float scale)
+          {
+              const char *s = str.c_str();
+              int n = 0;
+              while (*s) { nextCp(s); n++; }
+              return n * 8.0f * scale;
+          }
+
+          static void text(const std::string &str, float x, float y, float scale, Col c)
+          {
+              const char *s = str.c_str();
+              while (*s) {
+                  unsigned cp = nextCp(s);
+                  if (cp != ' ') {
+                      int i = glyphIndex(cp);
+                      float u0 = (i % 16) * 8 / (float)kAtlasW, v0 = (i / 16) * 16 / (float)kAtlasH;
+                      quad(x, y, x + 8 * scale, y + 16 * scale, u0, v0, u0 + 8 / (float)kAtlasW, v0 + 16 / (float)kAtlasH, c);
+                  }
+                  x += 8 * scale;
+              }
+          }
+
+          static void flush()
+          {
+              if (gVerts.empty()) return;
+              glUseProgram(gProg);
+              glUniform2f(gUScreen, kCanvasW, kCanvasH);
+              glUniform1i(gUTex, 0);
+              glActiveTexture(GL_TEXTURE0);
+              glBindTexture(GL_TEXTURE_2D, gTex);
+              glBindBuffer(GL_ARRAY_BUFFER, gVbo);
+              glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(gVerts.size() * sizeof(Vtx)), gVerts.data(), GL_STREAM_DRAW);
+              glEnableVertexAttribArray(0);
+              glEnableVertexAttribArray(1);
+              glEnableVertexAttribArray(2);
+              glVertexAttribPointer(0, 2, GL_FLOAT, 0, sizeof(Vtx), (const void *)0);
+              glVertexAttribPointer(1, 2, GL_FLOAT, 0, sizeof(Vtx), (const void *)8);
+              glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, 1, sizeof(Vtx), (const void *)16);
+              glDrawArrays(GL_TRIANGLES, 0, (GLsizei)gVerts.size());
+              gVerts.clear();
+          }
+
+          // ---------------------------------------------------------------------------------------------
+          // Ajustes (se guardan en cubeevil4.cfg junto al ejecutable)
+          // ---------------------------------------------------------------------------------------------
+          struct Settings {
+              int quality = 1;   // 0 Alta, 1 Media, 2 Baja, 3 Minima
+              int scale = 1;     // 0 50%, 1 75%, 2 100%
+              int dist = 5;      // 0..5 -> 50..100 %
+              int dof = 0;       // desenfoque de profundidad
+              int fxaa = 0;      // suavizado de bordes
+              int fps = 1;       // mostrar FPS
+              int aspect = 0;    // 0 = 16:9, 1 = 4:3
+          };
+          static Settings gCfg;
+          static const char *kCfgFile = "cubeevil4.cfg";
+
+          static void saveCfg()
+          {
+              FILE *f = std::fopen(kCfgFile, "w");
+              if (!f) { std::fprintf(stderr, "[cfg] no pude escribir %s\n", kCfgFile); return; }
+              std::fprintf(f, "quality=%d\nscale=%d\ndist=%d\ndof=%d\nfxaa=%d\nfps=%d\naspect=%d\n",
+                           gCfg.quality, gCfg.scale, gCfg.dist, gCfg.dof, gCfg.fxaa, gCfg.fps, gCfg.aspect);
+              std::fclose(f);
+          }
+
+          static void loadCfg()
+          {
+              FILE *f = std::fopen(kCfgFile, "r");
+              if (!f) return;
+              char line[128];
+              while (std::fgets(line, sizeof(line), f)) {
+                  char key[32];
+                  int val;
+                  if (std::sscanf(line, "%31[^=]=%d", key, &val) != 2) continue;
+                  if (!std::strcmp(key, "quality")) gCfg.quality = std::clamp(val, 0, 3);
+                  else if (!std::strcmp(key, "scale")) gCfg.scale = std::clamp(val, 0, 2);
+                  else if (!std::strcmp(key, "dist")) gCfg.dist = std::clamp(val, 0, 5);
+                  else if (!std::strcmp(key, "dof")) gCfg.dof = val ? 1 : 0;
+                  else if (!std::strcmp(key, "fxaa")) gCfg.fxaa = val ? 1 : 0;
+                  else if (!std::strcmp(key, "fps")) gCfg.fps = val ? 1 : 0;
+                  else if (!std::strcmp(key, "aspect")) gCfg.aspect = std::clamp(val, 0, 1);
+              }
+              std::fclose(f);
+          }
+
+          // ---------------------------------------------------------------------------------------------
+          // Entrada: todos los mandos conectados a la vez (el que se use primero vale) + teclado para pruebas
+          // ---------------------------------------------------------------------------------------------
+          enum Btn { B_UP, B_DOWN, B_LEFT, B_RIGHT, B_A, B_B, B_X, B_Y, B_START, B_SELECT, B_R3, B_L3, B_GUIDE, B_L1, B_R1, B_COUNT };
+
+          struct Pad {
+              SDL_GameController *gc;
+              SDL_JoystickID id;
+              std::string name;
+          };
+          static std::vector<Pad> gPads;
+          static int gEventLog = 0;
+
+          static void openPad(int index)
+          {
+              if (!SDL_IsGameController(index)) {
+                  const char *n = SDL_JoystickNameForIndex(index);
+                  char guid[64];
+                  SDL_JoystickGetGUIDString(SDL_JoystickGetDeviceGUID(index), guid, sizeof(guid));
+                  std::printf("[mando] #%d '%s' guid=%s: SIN mapeo de mando (no esta en la base de SDL)\n", index, n ? n : "?", guid);
+                  return;
+              }
+              SDL_GameController *gc = SDL_GameControllerOpen(index);
+              if (!gc) { std::printf("[mando] #%d no se pudo abrir: %s\n", index, SDL_GetError()); return; }
+              SDL_JoystickID id = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(gc));
+              for (const Pad &p : gPads)
+                  if (p.id == id) { SDL_GameControllerClose(gc); return; }
+              const char *n = SDL_GameControllerName(gc);
+              gPads.push_back({gc, id, n ? n : "mando"});
+              std::printf("[mando] conectado #%d id=%d '%s'\n", index, (int)id, n ? n : "?");
+          }
+
+          static void closePad(SDL_JoystickID id)
+          {
+              for (size_t i = 0; i < gPads.size(); i++)
+                  if (gPads[i].id == id) {
+                      std::printf("[mando] desconectado '%s'\n", gPads[i].name.c_str());
+                      SDL_GameControllerClose(gPads[i].gc);
+                      gPads.erase(gPads.begin() + i);
+                      return;
+                  }
+          }
+
+          static bool padButton(SDL_GameControllerButton b)
+          {
+              for (const Pad &p : gPads)
+                  if (SDL_GameControllerGetButton(p.gc, b)) return true;
+              return false;
+          }
+
+          static int padAxis(SDL_GameControllerAxis a)
+          {
+              int best = 0;
+              for (const Pad &p : gPads) {
+                  int v = SDL_GameControllerGetAxis(p.gc, a);
+                  if (std::abs(v) > std::abs(best)) best = v;
+              }
+              return best;
+          }
+
+          static void readInput(bool cur[B_COUNT])
+          {
+              for (int i = 0; i < B_COUNT; i++) cur[i] = false;
+              cur[B_UP] = padButton(SDL_CONTROLLER_BUTTON_DPAD_UP);
+              cur[B_DOWN] = padButton(SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+              cur[B_LEFT] = padButton(SDL_CONTROLLER_BUTTON_DPAD_LEFT);
+              cur[B_RIGHT] = padButton(SDL_CONTROLLER_BUTTON_DPAD_RIGHT);
+              cur[B_A] = padButton(SDL_CONTROLLER_BUTTON_A);
+              cur[B_B] = padButton(SDL_CONTROLLER_BUTTON_B);
+              cur[B_X] = padButton(SDL_CONTROLLER_BUTTON_X);
+              cur[B_Y] = padButton(SDL_CONTROLLER_BUTTON_Y);
+              cur[B_START] = padButton(SDL_CONTROLLER_BUTTON_START);
+              cur[B_SELECT] = padButton(SDL_CONTROLLER_BUTTON_BACK);
+              cur[B_R3] = padButton(SDL_CONTROLLER_BUTTON_RIGHTSTICK);
+              cur[B_L3] = padButton(SDL_CONTROLLER_BUTTON_LEFTSTICK);
+              cur[B_GUIDE] = padButton(SDL_CONTROLLER_BUTTON_GUIDE);
+              cur[B_L1] = padButton(SDL_CONTROLLER_BUTTON_LEFTSHOULDER);
+              cur[B_R1] = padButton(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
+              // palanca izquierda como cruceta (para navegar el menu)
+              int lx = padAxis(SDL_CONTROLLER_AXIS_LEFTX), ly = padAxis(SDL_CONTROLLER_AXIS_LEFTY);
+              if (ly < -16000) cur[B_UP] = true;
+              if (ly > 16000) cur[B_DOWN] = true;
+              if (lx < -16000) cur[B_LEFT] = true;
+              if (lx > 16000) cur[B_RIGHT] = true;
+              // teclado (pruebas en PC)
+              const Uint8 *k = SDL_GetKeyboardState(nullptr);
+              if (k[SDL_SCANCODE_UP]) cur[B_UP] = true;
+              if (k[SDL_SCANCODE_DOWN]) cur[B_DOWN] = true;
+              if (k[SDL_SCANCODE_LEFT]) cur[B_LEFT] = true;
+              if (k[SDL_SCANCODE_RIGHT]) cur[B_RIGHT] = true;
+              if (k[SDL_SCANCODE_RETURN]) cur[B_A] = true;
+              if (k[SDL_SCANCODE_ESCAPE] || k[SDL_SCANCODE_BACKSPACE]) cur[B_B] = true;
+              if (k[SDL_SCANCODE_TAB]) cur[B_SELECT] = true;
+              if (k[SDL_SCANCODE_SPACE]) cur[B_START] = true;
+              if (k[SDL_SCANCODE_F2]) cur[B_R3] = true;
+          }
+
+          // ---------------------------------------------------------------------------------------------
+          // Menu del port
+          // ---------------------------------------------------------------------------------------------
+          enum Item { IT_QUALITY, IT_SCALE, IT_DIST, IT_DOF, IT_FXAA, IT_FPS, IT_ASPECT, IT_CHEATS, IT_SAVE, IT_QUIT, IT_COUNT };
+
+          static std::string itemLabel(int it)
+          {
+              static const char *quality[] = {"Alta", "Media", "Baja", "Mínima"};
+              static const char *scale[] = {"50%", "75%", "100%"};
+              static const char *onoff[] = {"No", "Sí"};
+              char buf[96];
+              switch (it) {
+              case IT_QUALITY: std::snprintf(buf, sizeof(buf), "Calidad gráfica      < %s >", quality[gCfg.quality]); break;
+              case IT_SCALE: std::snprintf(buf, sizeof(buf), "Resolución de dibujo < %s >", scale[gCfg.scale]); break;
+              case IT_DIST: std::snprintf(buf, sizeof(buf), "Distancia de visión  < %d%% >", 50 + gCfg.dist * 10); break;
+              case IT_DOF: std::snprintf(buf, sizeof(buf), "Desenfoque (DoF)     < %s >", onoff[gCfg.dof]); break;
+              case IT_FXAA: std::snprintf(buf, sizeof(buf), "Suavizado de bordes  < %s >", onoff[gCfg.fxaa]); break;
+              case IT_FPS: std::snprintf(buf, sizeof(buf), "Mostrar FPS          < %s >", onoff[gCfg.fps]); break;
+              case IT_ASPECT: std::snprintf(buf, sizeof(buf), "Formato de pantalla  < %s >", gCfg.aspect ? "4:3" : "16:9"); break;
+              case IT_CHEATS: std::snprintf(buf, sizeof(buf), "Trucos (cheats)      próximamente"); break;
+              case IT_SAVE: std::snprintf(buf, sizeof(buf), "Guardar y volver al juego"); break;
+              default: std::snprintf(buf, sizeof(buf), "Salir del juego"); break;
+              }
+              return buf;
+          }
+
+          static void changeItem(int it, int dir)
+          {
+              switch (it) {
+              case IT_QUALITY: gCfg.quality = std::clamp(gCfg.quality + dir, 0, 3); break;
+              case IT_SCALE: gCfg.scale = std::clamp(gCfg.scale + dir, 0, 2); break;
+              case IT_DIST: gCfg.dist = std::clamp(gCfg.dist + dir, 0, 5); break;
+              case IT_DOF: gCfg.dof ^= 1; break;
+              case IT_FXAA: gCfg.fxaa ^= 1; break;
+              case IT_FPS: gCfg.fps ^= 1; break;
+              case IT_ASPECT: gCfg.aspect ^= 1; break;
+              default: break;
+              }
+          }
+
+          // ---------------------------------------------------------------------------------------------
+          int main(int argc, char **argv)
+          {
+              (void)argc;
+              (void)argv;
+              std::setvbuf(stdout, nullptr, _IOLBF, 0);
+              std::printf("== re4_emu (CubeEvil4 para EmuELEC, etapa 2a: ventana + mando + menu) ==\n");
+              loadCfg();
+
+              if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_JOYSTICK | SDL_INIT_TIMER) != 0) {
+                  std::printf("ERROR: SDL_Init: %s\n", SDL_GetError());
+                  return 2;
+              }
+              SDL_version cv, lv;
+              SDL_VERSION(&cv);
+              SDL_GetVersion(&lv);
+              std::printf("SDL compilado %d.%d.%d, en uso %d.%d.%d, driver de video: %s\n", cv.major, cv.minor, cv.patch,
+                          lv.major, lv.minor, lv.patch, SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "?");
+
+              const bool windowed = std::getenv("RE4_EMU_WINDOWED") != nullptr;
+              SDL_DisplayMode dm;
+              int dw = 1280, dh = 720;
+              if (SDL_GetDesktopDisplayMode(0, &dm) == 0) { dw = dm.w; dh = dm.h; }
+              std::printf("pantalla: %dx%d\n", dw, dh);
+
+              SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+              SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+              SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+              Uint32 flags = SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN | (windowed ? 0 : SDL_WINDOW_FULLSCREEN);
+              int ww = windowed ? 1280 : dw, wh = windowed ? 720 : dh;
+              SDL_Window *win = SDL_CreateWindow("CubeEvil4", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, ww, wh, flags);
+              if (!win) { std::printf("ERROR: SDL_CreateWindow: %s\n", SDL_GetError()); SDL_Quit(); return 3; }
+              SDL_GLContext ctx = SDL_GL_CreateContext(win);
+              if (!ctx) {
+                  std::printf("AVISO: contexto GLES 3.0 no disponible (%s); pruebo GLES 2.0\n", SDL_GetError());
+                  SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+                  SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+                  ctx = SDL_GL_CreateContext(win);
+              }
+              if (!ctx) { std::printf("ERROR: SDL_GL_CreateContext: %s\n", SDL_GetError()); SDL_DestroyWindow(win); SDL_Quit(); return 4; }
+              if (!loadGL()) { std::printf("ERROR: faltan funciones de GL\n"); return 5; }
+              SDL_GL_SetSwapInterval(1);
+              int gw = ww, gh = wh;
+              SDL_GL_GetDrawableSize(win, &gw, &gh);
+              auto gs = [](GLenum e) { const unsigned char *s = glGetString(e); return s ? (const char *)s : "?"; };
+              std::printf("GL: vendedor='%s' dibujo='%s' version='%s' glsl='%s'\n", gs(GL_VENDOR), gs(GL_RENDERER), gs(GL_VERSION),
+                          gs(GL_SHADING_LANGUAGE_VERSION));
+              std::printf("ventana: %dx%d (area de dibujo %dx%d)\n", ww, wh, gw, gh);
+              if (!initDraw()) { std::printf("ERROR: no pude preparar el dibujo 2D\n"); return 6; }
+
+              std::printf("mandos detectados por SDL: %d\n", SDL_NumJoysticks());
+              for (int i = 0; i < SDL_NumJoysticks(); i++) openPad(i);
+
+              // viewport 16:9 centrado (barras negras si la pantalla no es 16:9)
+              float sc = std::min(gw / kCanvasW, gh / kCanvasH);
+              int vw = (int)(kCanvasW * sc), vh = (int)(kCanvasH * sc);
+              int vx = (gw - vw) / 2, vy = (gh - vh) / 2;
+
+              const int testSeconds = std::getenv("RE4_EMU_TEST_SECONDS") ? std::atoi(std::getenv("RE4_EMU_TEST_SECONDS")) : 0;
+              const char *shotPath = std::getenv("RE4_EMU_SHOT");
+              const int shotFrame = std::getenv("RE4_EMU_SHOT_FRAME") ? std::atoi(std::getenv("RE4_EMU_SHOT_FRAME")) : 45;
+              const bool autoMenu = std::getenv("RE4_EMU_AUTOMENU") != nullptr;
+
+              bool prev[B_COUNT] = {false}, cur[B_COUNT] = {false};
+              bool menuOpen = false, quit = false;
+              int sel = 0;
+              Uint64 t0 = SDL_GetPerformanceCounter(), freq = SDL_GetPerformanceFrequency();
+              double lastSelDown = -1, comboStart = -1, repeatAt = 0;
+              bool selCombo = false, selLongShown = false;
+              std::string lastBtn = "(ninguno)";
+              int frames = 0, fpsFrames = 0;
+              double fpsT = 0, fpsVal = 0;
+
+              while (!quit) {
+                  double now = (double)(SDL_GetPerformanceCounter() - t0) / (double)freq;
+                  SDL_Event e;
+                  while (SDL_PollEvent(&e)) {
+                      if (e.type == SDL_QUIT) quit = true;
+                      else if (e.type == SDL_CONTROLLERDEVICEADDED) openPad(e.cdevice.which);
+                      else if (e.type == SDL_CONTROLLERDEVICEREMOVED) closePad(e.cdevice.which);
+                      else if (e.type == SDL_CONTROLLERBUTTONDOWN) {
+                          const char *n = SDL_GameControllerGetStringForButton((SDL_GameControllerButton)e.cbutton.button);
+                          lastBtn = n ? n : "?";
+                          if (gEventLog++ < 300) std::printf("[mando] boton %s (t=%.1fs)\n", lastBtn.c_str(), now);
+                      } else if (e.type == SDL_CONTROLLERBUTTONUP) {
+                          if (gEventLog < 300) std::printf("[mando] suelta %s\n", SDL_GameControllerGetStringForButton((SDL_GameControllerButton)e.cbutton.button));
+                      }
+                  }
+                  readInput(cur);
+                  auto edge = [&](Btn b) { return cur[b] && !prev[b]; };
+
+                  // --- salir: SELECT (o GUIA) + START mantenidos 1,5 s
+                  bool combo = (cur[B_SELECT] || cur[B_GUIDE]) && cur[B_START];
+                  if (combo) {
+                      if (comboStart < 0) comboStart = now;
+                      if (now - comboStart >= 1.5) quit = true;
+                  } else comboStart = -1;
+
+                  // --- SELECT: pulsar = menu, mantener = menu de depuracion del juego (aun no conectado)
+                  if (edge(B_SELECT)) { lastSelDown = now; selCombo = false; selLongShown = false; }
+                  if (cur[B_SELECT] && cur[B_START]) selCombo = true;
+                  if (cur[B_SELECT] && lastSelDown >= 0 && now - lastSelDown >= 1.0 && !selCombo) selLongShown = true;
+                  if (!cur[B_SELECT] && prev[B_SELECT] && !selCombo) {
+                      if (now - lastSelDown < 1.0) { menuOpen = !menuOpen; if (menuOpen) sel = 0; if (!menuOpen) saveCfg(); }
+                  }
+                  if (edge(B_R3)) { menuOpen = !menuOpen; if (menuOpen) sel = 0; if (!menuOpen) saveCfg(); }
+                  if (autoMenu && frames == 10) menuOpen = true;
+
+                  // --- navegacion del menu (con repeticion al mantener izquierda/derecha/arriba/abajo)
+                  if (menuOpen) {
+                      bool rep = false;
+                      for (Btn b : {B_UP, B_DOWN, B_LEFT, B_RIGHT})
+                          if (cur[b] && !prev[b]) repeatAt = now + 0.4;
+                      if ((cur[B_UP] || cur[B_DOWN] || cur[B_LEFT] || cur[B_RIGHT]) && now >= repeatAt && repeatAt > 0) {
+                          rep = true;
+                          repeatAt = now + 0.12;
+                      }
+                      if (edge(B_UP) || (rep && cur[B_UP])) sel = (sel + IT_COUNT - 1) % IT_COUNT;
+                      if (edge(B_DOWN) || (rep && cur[B_DOWN])) sel = (sel + 1) % IT_COUNT;
+                      if (edge(B_LEFT) || (rep && cur[B_LEFT])) changeItem(sel, -1);
+                      if (edge(B_RIGHT) || (rep && cur[B_RIGHT])) changeItem(sel, +1);
+                      if (edge(B_A)) {
+                          if (sel == IT_SAVE) { menuOpen = false; saveCfg(); }
+                          else if (sel == IT_QUIT) { saveCfg(); quit = true; }
+                          else changeItem(sel, +1);
+                      }
+                      if (edge(B_B)) { menuOpen = false; saveCfg(); }
+                  }
+                  for (int i = 0; i < B_COUNT; i++) prev[i] = cur[i];
+
+                  // --- fin automatico de prueba
+                  if (testSeconds > 0 && now >= testSeconds) { std::printf("fin automatico (%d s)\n", testSeconds); quit = true; }
+
+                  // --- dibujo
+                  glViewport(0, 0, gw, gh);
+                  glClearColor(0, 0, 0, 1);
+                  glClear(GL_COLOR_BUFFER_BIT);
+                  glViewport(vx, vy, vw, vh);
+                  glEnable(GL_BLEND);
+                  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+                  rect(0, 0, kCanvasW, kCanvasH, {12, 16, 30, 255});
+                  rect(0, 0, kCanvasW, 36, {150, 20, 20, 255});
+                  text("CubeEvil4 para EmuELEC", 12, 6, 2, {255, 255, 255, 255});
+
+                  char line[200];
+                  float y = 50;
+                  auto put = [&](const std::string &s, Col c = {220, 225, 235, 255}) { text(s, 14, y, 1, c); y += 18; };
+                  put("Etapa 2a: prueba de ventana, mando y menú (sin juego todavía)", {255, 210, 90, 255});
+                  std::snprintf(line, sizeof(line), "Video: %s %dx%d   GL: %s", SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "?", gw, gh, gs(GL_VERSION));
+                  put(line);
+                  put(std::string("Dibujo: ") + gs(GL_RENDERER));
+                  std::snprintf(line, sizeof(line), "Mandos conectados: %d", (int)gPads.size());
+                  put(line);
+                  for (const Pad &p : gPads) put("  - " + p.name, {140, 220, 160, 255});
+                  if (gPads.empty()) put("  (ninguno: conecta un mando; teclado: flechas/Intro/Tab)", {240, 150, 150, 255});
+                  put("Último botón: " + lastBtn);
+                  std::snprintf(line, sizeof(line), "Ahora pulsado:%s%s%s%s%s%s%s%s", cur[B_A] ? " A" : "", cur[B_B] ? " B" : "",
+                                cur[B_X] ? " X" : "", cur[B_Y] ? " Y" : "", cur[B_START] ? " START" : "", cur[B_SELECT] ? " SELECT" : "",
+                                cur[B_L3] ? " L3" : "", cur[B_R3] ? " R3" : "");
+                  put(line);
+                  if (selLongShown) put("SELECT mantenido: aquí se abriría el menú de depuración del juego (solo discos debug)", {255, 210, 90, 255});
+                  // barra que se mueve: ayuda a ver fluidez y tirones
+                  float bx = (float)((std::sin(now * 2.5) + 1.0) * 0.5 * (kCanvasW - 60));
+                  rect(0, 292, kCanvasW, 22, {25, 30, 50, 255});
+                  rect(bx, 294, 60, 18, {80, 200, 120, 255});
+                  text("SELECT: menú   R3: menú   SELECT+START (1,5 s): salir", 12, 326, 1, {170, 180, 200, 255});
+
+                  if (gCfg.fps) {
+                      std::snprintf(line, sizeof(line), "%.0f FPS", fpsVal);
+                      text(line, kCanvasW - 8 * (float)std::strlen(line) - 8, 44, 1, {255, 255, 120, 255});
+                  }
+                  if (comboStart >= 0) {
+                      float p = (float)std::min(1.0, (now - comboStart) / 1.5);
+                      rect(170, 250, 300, 22, {0, 0, 0, 220});
+                      rect(174, 254, 292 * p, 14, {230, 70, 70, 255});
+                      text("Saliendo...", 270, 232, 1, {255, 255, 255, 255});
+                  }
+
+                  if (menuOpen) {
+                      rect(0, 0, kCanvasW, kCanvasH, {0, 0, 0, 170});
+                      float px = 90, py = 40, pw = 460, ph = 280;
+                      rect(px, py, pw, ph, {20, 24, 42, 245});
+                      rect(px, py, pw, 28, {150, 20, 20, 255});
+                      text("Menú de CubeEvil4", px + 12, py + 6, 1, {255, 255, 255, 255});
+                      for (int i = 0; i < IT_COUNT; i++) {
+                          float iy = py + 40 + i * 22;
+                          if (i == sel) rect(px + 8, iy - 3, pw - 16, 22, {70, 90, 160, 255});
+                          Col c = (i == IT_CHEATS) ? Col{140, 140, 150, 255} : Col{235, 238, 245, 255};
+                          text(itemLabel(i), px + 18, iy, 1, c);
+                      }
+                      text("Arr/Abj: elegir  Izq/Der: cambiar  A: ok  B: cerrar", px + 8, py + ph - 22, 1, {170, 180, 200, 255});
+                  }
+                  flush();
+
+                  frames++;
+                  fpsFrames++;
+                  if (now - fpsT >= 1.0) { fpsVal = fpsFrames / (now - fpsT); fpsFrames = 0; fpsT = now; }
+
+                  if (shotPath && frames == shotFrame) {
+                      std::vector<unsigned char> px((size_t)gw * gh * 4), flip((size_t)gw * gh * 4);
+                      glPixelStorei(GL_PACK_ALIGNMENT, 1);
+                      glReadPixels(0, 0, gw, gh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+                      for (int yy = 0; yy < gh; yy++) std::memcpy(&flip[(size_t)yy * gw * 4], &px[(size_t)(gh - 1 - yy) * gw * 4], (size_t)gw * 4);
+                      SDL_Surface *s = SDL_CreateRGBSurfaceFrom(flip.data(), gw, gh, 32, gw * 4, 0x000000FF, 0x0000FF00, 0x00FF0000, 0xFF000000);
+                      if (s) { SDL_SaveBMP(s, shotPath); SDL_FreeSurface(s); std::printf("captura guardada: %s\n", shotPath); }
+                  }
+                  SDL_GL_SwapWindow(win);
+              }
+
+              saveCfg();
+              for (const Pad &p : gPads) SDL_GameControllerClose(p.gc);
+              SDL_GL_DeleteContext(ctx);
+              SDL_DestroyWindow(win);
+              SDL_Quit();
+              std::printf("fin\n");
+              return 0;
+          }
+          RE4_EMU_SRC_END
+          /opt/wrap/clang++ --target=aarch64-linux-gnu -std=c++17 -O2 -Wall \
+            -isystem /opt/sdl2dev/usr/include/SDL2 -isystem /opt/sdl2dev/usr/include -Iemu \
+            emu/re4_emu.cpp -o out/re4_emu \
+            /opt/sdl2dev/usr/lib/aarch64-linux-gnu/libSDL2-2.0.so.0 \
+            -static-libstdc++ -static-libgcc -Wl,--allow-shlib-undefined
+          file out/re4_emu
+          readelf -d out/re4_emu | grep -E "NEEDED|RUNPATH|RPATH" || true
+          echo "== GLIBC que pide re4_emu =="
+          readelf -Ws --dyn-syms out/re4_emu | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -3
+
       - name: Cache del compilador (ccache)
         uses: actions/cache@v4
         with:
@@ -232,10 +1062,10 @@ jobs:
         run: |
           cd out
           echo "== GLIBC maximo pedido (la caja tiene 2.29) =="
-          find . -type f \( -name '*.so*' -o -name re4_host \) | while read -r f; do
+          find . -type f \( -name '*.so*' -o -name re4_host -o -name re4_emu \) | while read -r f; do
             readelf -Ws --dyn-syms "$f" 2>/dev/null | grep -o 'GLIBC_[0-9.]*'; done | sort -uV | tail -3
           echo "== GLIBCXX maximo pedido (la caja llega a 3.4.25) =="
-          find . -type f \( -name '*.so*' -o -name re4_host \) | while read -r f; do
+          find . -type f \( -name '*.so*' -o -name re4_host -o -name re4_emu \) | while read -r f; do
             readelf -Ws --dyn-syms "$f" 2>/dev/null | grep -o 'GLIBCXX_[0-9.]*'; done | sort -uV | tail -3
           echo "== librerias que pide el nucleo =="
           readelf -d libre4_main.so re4_host libre4_host.so 2>/dev/null | grep -E "NEEDED|RUNPATH|RPATH|File:" || true
