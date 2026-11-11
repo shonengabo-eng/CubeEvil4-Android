@@ -1050,6 +1050,7 @@ jobs:
               decltype(&re4_core_set_potato) setPotato = nullptr;
               decltype(&re4_core_set_view_distance) setViewDistance = nullptr;
               decltype(&re4_core_set_dof) setDof = nullptr;
+              decltype(&re4_core_set_cpu_skip) setCpuSkip = nullptr;
               decltype(&re4_core_debug_menu) debugMenu = nullptr;
               decltype(&re4_core_disc_problem) discProblem = nullptr;
           };
@@ -1078,6 +1079,7 @@ jobs:
           {
               if (gApi.lib) return true;
               std::string path = exeDir() + "/libre4_main.so";
+              setenv("RE4_GX_THREADS", "2", 0);  // hilos de vertices: 2 (por defecto 1 con 4 nucleos); el lanzador puede cambiarlo
               gApi.lib = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
               if (!gApi.lib) { err = std::string("no pude cargar libre4_main.so: ") + dlerror(); return false; }
               return bindSym(gApi.reserve, "re4_core_reserve", err, true) && bindSym(gApi.start, "re4_core_start", err, true) &&
@@ -1087,6 +1089,7 @@ jobs:
                      bindSym(gApi.vsync, "re4_core_vsync", err, false) && bindSym(gApi.pause, "re4_core_pause", err, false) &&
                      bindSym(gApi.setPotato, "re4_core_set_potato", err, false) &&
                      bindSym(gApi.setViewDistance, "re4_core_set_view_distance", err, false) &&
+                     bindSym(gApi.setCpuSkip, "re4_core_set_cpu_skip", err, false) &&
                      bindSym(gApi.setDof, "re4_core_set_dof", err, false) && bindSym(gApi.debugMenu, "re4_core_debug_menu", err, false) &&
                      bindSym(gApi.discProblem, "re4_core_disc_problem", err, false);
           }
@@ -1104,6 +1107,7 @@ jobs:
               if (gApi.setPotato) gApi.setPotato(potatoMask(gCfg.quality));
               if (gApi.setViewDistance) gApi.setViewDistance(50 + gCfg.dist * 10);
               if (gApi.setDof) gApi.setDof(gCfg.dof);
+              if (gApi.setCpuSkip) gApi.setCpuSkip(1);  // salto de imagenes agresivo: la logica sigue, se dibuja menos
               if (gGx) {
                   gGx->SetFxaa(gCfg.fxaa != 0);
                   gGx->RescaleHalves(2 + gCfg.scale);
@@ -1527,12 +1531,16 @@ jobs:
                       Re4CorePad pd = makePad(menuOpen, cur[B_SELECT] || cur[B_GUIDE]);
                       gApi.pad(&pd);
                       int ran = 0;
+                      // como mucho ~12 ms de cuadros por vuelta: se dibuja y se muestra seguido en vez de
+                      // vaciar hasta 64 cuadros de golpe (eso congelaba la imagen ~2,5 s con el juego corriendo)
+                      const Uint32 runStart = SDL_GetTicks();
                       while (ran < 64) {
                           const Re4GxChunk *c = gApi.gxAcquire();
                           if (!c) break;
                           gGx->Run(*c);
                           gApi.gxRelease(c);
                           ran++;
+                          if (SDL_GetTicks() - runStart >= 12) break;
                       }
                       if (!ran) gGx->Prewarm(2.0);
                       int st = gApi.state();
