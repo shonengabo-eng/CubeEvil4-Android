@@ -4,6 +4,7 @@ name: EmuELEC core (aarch64, glibc 2.28)
 # libstdc++ hasta GLIBCXX_3.4.25). Usa un sysroot de Debian buster (glibc 2.28,
 # gcc-8) para que los binarios no pidan simbolos mas nuevos que los de la caja.
 # Se lanza a mano: pestana Actions -> "EmuELEC core" -> Run workflow.
+# v11: re4_emu es ahora el lanzador (copia de loader.c) y libre4_emu.so el frontend con el juego, la imagen (GX->GLES), el sonido y el mando.
 # v10: anade el frontend re4_emu (SDL2 + GLES: ventana, mando y menu) compilado antes del nucleo.
 # v9: carpeta out/ con la misma estructura que espera re4_host (modules/) + probar.sh.
 # v8: el paso de reunir el resultado fallaba por un 'Permission denied' de find; ccache anadido.
@@ -194,9 +195,32 @@ jobs:
           test -f /opt/sdl2dev/usr/include/SDL2/SDL.h
           test -e /opt/sdl2dev/usr/lib/aarch64-linux-gnu/libSDL2-2.0.so.0
 
-      - name: Compilar el frontend (re4_emu)
+      - name: Cabeceras de GLES3 (Khronos), biblioteca vacia libGLESv2 y adaptador de log
         run: |
-          mkdir -p emu out
+          mkdir -p emu/glhdr/GLES3 emu/glhdr/KHR emu/stubs emu/shim/android out
+          base=https://raw.githubusercontent.com/KhronosGroup/OpenGL-Registry/main/api
+          ebase=https://raw.githubusercontent.com/KhronosGroup/EGL-Registry/main/api
+          curl -fsSL "$base/GLES3/gl3.h" -o emu/glhdr/GLES3/gl3.h
+          curl -fsSL "$base/GLES3/gl3platform.h" -o emu/glhdr/GLES3/gl3platform.h
+          curl -fsSL "$base/KHR/khrplatform.h" -o emu/glhdr/KHR/khrplatform.h || curl -fsSL "$ebase/KHR/khrplatform.h" -o emu/glhdr/KHR/khrplatform.h
+          ls -la emu/glhdr/GLES3 emu/glhdr/KHR
+          # libGLESv2 vacia solo para que quede anotada como dependencia (las funciones salen de la libMali de la caja)
+          echo 'void re4_stub_gles(void) {}' > emu/stubs/stub.c
+          /opt/wrap/clang --target=aarch64-linux-gnu -shared -fPIC -o emu/stubs/libGLESv2.so.2 emu/stubs/stub.c -Wl,-soname,libGLESv2.so.2
+          # el renderizador del proyecto escribe su log con <android/log.h>: aqui va a la salida de errores
+          cat > emu/shim/android/log.h <<'RE4_EMU_SRC_END'
+          #pragma once
+          #include <cstdio>
+          #define ANDROID_LOG_VERBOSE 2
+          #define ANDROID_LOG_DEBUG 3
+          #define ANDROID_LOG_INFO 4
+          #define ANDROID_LOG_WARN 5
+          #define ANDROID_LOG_ERROR 6
+          #define __android_log_print(prio, tag, ...) (std::fprintf(stderr, "[%s] ", tag), std::fprintf(stderr, __VA_ARGS__), std::fprintf(stderr, "\n"), 0)
+          RE4_EMU_SRC_END
+
+      - name: Compilar libre4_emu.so (frontend + renderizador) y el lanzador re4_emu
+        run: |
           cat > emu/font_data.h <<'RE4_EMU_SRC_END'
           // Fuente 8x16 de 1 bit generada con DejaVu Sans Mono Bold (licencia libre de Bitstream Vera/DejaVu).
           // Un glifo = 16 bytes (una fila por byte, el bit alto es el pixel de la izquierda).
@@ -335,93 +359,35 @@ jobs:
           //   RE4_EMU_AUTOMENU=1        abre el menu solo (para la captura)
 
           #include <SDL.h>
+          #include <GLES3/gl3.h>
           #include <algorithm>
+          #include <atomic>
+          #include <cerrno>
           #include <cmath>
           #include <cstdint>
           #include <cstdio>
           #include <cstdlib>
           #include <cstring>
+          #include <dirent.h>
+          #include <dlfcn.h>
+          #include <execinfo.h>
+          #include <libgen.h>
+          #include <limits.h>
+          #include <memory>
+          #include <signal.h>
+          #include <set>
           #include <string>
+          #include <sys/stat.h>
+          #include <sys/statvfs.h>
+          #include <thread>
+          #include <unistd.h>
           #include <vector>
 
           #include "font_data.h"
+          #include "gx_gl.h"
+          #include "re4_core.h"
+          #include "re4_gx_frame.h"
 
-          // ---------------------------------------------------------------------------------------------
-          // OpenGL ES minimo: sin cabeceras de GL, las funciones se piden a SDL (asi no hace falta enlazar
-          // libGLESv2 al compilar y se usa la libGLESv2/libMali de la caja).
-          // ---------------------------------------------------------------------------------------------
-          typedef unsigned int GLenum, GLuint, GLbitfield;
-          typedef int GLint, GLsizei;
-          typedef float GLfloat;
-          typedef char GLchar;
-          typedef unsigned char GLboolean;
-          typedef ptrdiff_t GLsizeiptr;
-
-          enum : unsigned {
-              GL_COLOR_BUFFER_BIT = 0x4000, GL_TRIANGLES = 0x0004, GL_FLOAT = 0x1406, GL_UNSIGNED_BYTE = 0x1401,
-              GL_TEXTURE_2D = 0x0DE1, GL_RGBA = 0x1908, GL_TEXTURE_MIN_FILTER = 0x2801, GL_TEXTURE_MAG_FILTER = 0x2800,
-              GL_NEAREST = 0x2600, GL_CLAMP_TO_EDGE = 0x812F, GL_TEXTURE_WRAP_S = 0x2802, GL_TEXTURE_WRAP_T = 0x2803,
-              GL_VERTEX_SHADER = 0x8B31, GL_FRAGMENT_SHADER = 0x8B30, GL_COMPILE_STATUS = 0x8B81, GL_LINK_STATUS = 0x8B82,
-              GL_INFO_LOG_LENGTH = 0x8B84, GL_ARRAY_BUFFER = 0x8892, GL_STREAM_DRAW = 0x88E0, GL_BLEND = 0x0BE2,
-              GL_SRC_ALPHA = 0x0302, GL_ONE_MINUS_SRC_ALPHA = 0x0303, GL_TEXTURE0 = 0x84C0, GL_VENDOR = 0x1F00,
-              GL_RENDERER = 0x1F01, GL_VERSION = 0x1F02, GL_SHADING_LANGUAGE_VERSION = 0x8B8C, GL_DEPTH_TEST = 0x0B71,
-              GL_UNPACK_ALIGNMENT = 0x0CF5, GL_PACK_ALIGNMENT = 0x0D05, GL_CULL_FACE = 0x0B44, GL_SCISSOR_TEST = 0x0C11
-          };
-
-          #define GLFN(ret, name, ...) \
-              typedef ret (*name##_t)(__VA_ARGS__); \
-              static name##_t name = nullptr;
-          GLFN(void, glClear, GLbitfield)
-          GLFN(void, glClearColor, GLfloat, GLfloat, GLfloat, GLfloat)
-          GLFN(void, glViewport, GLint, GLint, GLsizei, GLsizei)
-          GLFN(void, glEnable, GLenum)
-          GLFN(void, glDisable, GLenum)
-          GLFN(void, glBlendFunc, GLenum, GLenum)
-          GLFN(const unsigned char *, glGetString, GLenum)
-          GLFN(GLuint, glCreateShader, GLenum)
-          GLFN(void, glShaderSource, GLuint, GLsizei, const GLchar *const *, const GLint *)
-          GLFN(void, glCompileShader, GLuint)
-          GLFN(void, glGetShaderiv, GLuint, GLenum, GLint *)
-          GLFN(void, glGetShaderInfoLog, GLuint, GLsizei, GLsizei *, GLchar *)
-          GLFN(GLuint, glCreateProgram, void)
-          GLFN(void, glAttachShader, GLuint, GLuint)
-          GLFN(void, glBindAttribLocation, GLuint, GLuint, const GLchar *)
-          GLFN(void, glLinkProgram, GLuint)
-          GLFN(void, glGetProgramiv, GLuint, GLenum, GLint *)
-          GLFN(void, glGetProgramInfoLog, GLuint, GLsizei, GLsizei *, GLchar *)
-          GLFN(void, glUseProgram, GLuint)
-          GLFN(GLint, glGetUniformLocation, GLuint, const GLchar *)
-          GLFN(void, glUniform2f, GLint, GLfloat, GLfloat)
-          GLFN(void, glUniform1i, GLint, GLint)
-          GLFN(void, glEnableVertexAttribArray, GLuint)
-          GLFN(void, glVertexAttribPointer, GLuint, GLint, GLenum, GLboolean, GLsizei, const void *)
-          GLFN(void, glGenBuffers, GLsizei, GLuint *)
-          GLFN(void, glBindBuffer, GLenum, GLuint)
-          GLFN(void, glBufferData, GLenum, GLsizeiptr, const void *, GLenum)
-          GLFN(void, glDrawArrays, GLenum, GLint, GLsizei)
-          GLFN(void, glGenTextures, GLsizei, GLuint *)
-          GLFN(void, glBindTexture, GLenum, GLuint)
-          GLFN(void, glTexImage2D, GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *)
-          GLFN(void, glTexParameteri, GLenum, GLenum, GLint)
-          GLFN(void, glActiveTexture, GLenum)
-          GLFN(void, glPixelStorei, GLenum, GLint)
-          GLFN(void, glReadPixels, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *)
-
-          static bool loadGL()
-          {
-              bool ok = true;
-          #define LOAD(n) do { n = (n##_t)SDL_GL_GetProcAddress(#n); if (!n) { std::fprintf(stderr, "[gl] falta %s\n", #n); ok = false; } } while (0)
-              LOAD(glClear); LOAD(glClearColor); LOAD(glViewport); LOAD(glEnable); LOAD(glDisable); LOAD(glBlendFunc);
-              LOAD(glGetString); LOAD(glCreateShader); LOAD(glShaderSource); LOAD(glCompileShader); LOAD(glGetShaderiv);
-              LOAD(glGetShaderInfoLog); LOAD(glCreateProgram); LOAD(glAttachShader); LOAD(glBindAttribLocation);
-              LOAD(glLinkProgram); LOAD(glGetProgramiv); LOAD(glGetProgramInfoLog); LOAD(glUseProgram);
-              LOAD(glGetUniformLocation); LOAD(glUniform2f); LOAD(glUniform1i); LOAD(glEnableVertexAttribArray);
-              LOAD(glVertexAttribPointer); LOAD(glGenBuffers); LOAD(glBindBuffer); LOAD(glBufferData); LOAD(glDrawArrays);
-              LOAD(glGenTextures); LOAD(glBindTexture); LOAD(glTexImage2D); LOAD(glTexParameteri); LOAD(glActiveTexture);
-              LOAD(glPixelStorei); LOAD(glReadPixels);
-          #undef LOAD
-              return ok;
-          }
 
           // ---------------------------------------------------------------------------------------------
           // Dibujo 2D (texto y rectangulos) sobre un lienzo virtual de 640x360
@@ -432,7 +398,7 @@ jobs:
           struct Col { unsigned char r, g, b, a; };
           struct Vtx { float x, y, u, v; unsigned char r, g, b, a; };
 
-          static GLuint gProg = 0, gVbo = 0, gTex = 0;
+          static GLuint gProg = 0, gVbo = 0, gTex = 0, gVao = 0;
           static GLint gUScreen = -1, gUTex = -1;
           static std::vector<Vtx> gVerts;
 
@@ -514,6 +480,7 @@ jobs:
               glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
               glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
               glGenBuffers(1, &gVbo);
+              glGenVertexArrays(1, &gVao);
               return true;
           }
 
@@ -577,20 +544,32 @@ jobs:
           static void flush()
           {
               if (gVerts.empty()) return;
+              // estado propio del overlay (el renderizador del juego deja el suyo; se deja como la app Android: VAO 0, sin programa)
+              glDisable(GL_SCISSOR_TEST);
+              glDisable(GL_DEPTH_TEST);
+              glDisable(GL_CULL_FACE);
+              glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+              glEnable(GL_BLEND);
+              glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
               glUseProgram(gProg);
               glUniform2f(gUScreen, kCanvasW, kCanvasH);
               glUniform1i(gUTex, 0);
               glActiveTexture(GL_TEXTURE0);
               glBindTexture(GL_TEXTURE_2D, gTex);
+              glBindVertexArray(gVao);
               glBindBuffer(GL_ARRAY_BUFFER, gVbo);
               glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(gVerts.size() * sizeof(Vtx)), gVerts.data(), GL_STREAM_DRAW);
               glEnableVertexAttribArray(0);
               glEnableVertexAttribArray(1);
               glEnableVertexAttribArray(2);
-              glVertexAttribPointer(0, 2, GL_FLOAT, 0, sizeof(Vtx), (const void *)0);
-              glVertexAttribPointer(1, 2, GL_FLOAT, 0, sizeof(Vtx), (const void *)8);
-              glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, 1, sizeof(Vtx), (const void *)16);
+              glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(Vtx), (const void *)0);
+              glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(Vtx), (const void *)8);
+              glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(Vtx), (const void *)16);
               glDrawArrays(GL_TRIANGLES, 0, (GLsizei)gVerts.size());
+              glBindVertexArray(0);
+              glBindBuffer(GL_ARRAY_BUFFER, 0);
+              glUseProgram(0);
+              glDisable(GL_BLEND);
               gVerts.clear();
           }
 
@@ -599,7 +578,7 @@ jobs:
           // ---------------------------------------------------------------------------------------------
           struct Settings {
               int quality = 1;   // 0 Alta, 1 Media, 2 Baja, 3 Minima
-              int scale = 1;     // 0 50%, 1 75%, 2 100%
+              int scale = 0;     // resolucion interna: 0 = 1x (nativa), 1 = 1,5x, 2 = 2x
               int dist = 5;      // 0..5 -> 50..100 %
               int dof = 0;       // desenfoque de profundidad
               int fxaa = 0;      // suavizado de bordes
@@ -743,12 +722,12 @@ jobs:
           static std::string itemLabel(int it)
           {
               static const char *quality[] = {"Alta", "Media", "Baja", "Mínima"};
-              static const char *scale[] = {"50%", "75%", "100%"};
+              static const char *scale[] = {"1x", "1,5x", "2x"};
               static const char *onoff[] = {"No", "Sí"};
               char buf[96];
               switch (it) {
               case IT_QUALITY: std::snprintf(buf, sizeof(buf), "Calidad gráfica      < %s >", quality[gCfg.quality]); break;
-              case IT_SCALE: std::snprintf(buf, sizeof(buf), "Resolución de dibujo < %s >", scale[gCfg.scale]); break;
+              case IT_SCALE: std::snprintf(buf, sizeof(buf), "Resolución interna   < %s >", scale[gCfg.scale]); break;
               case IT_DIST: std::snprintf(buf, sizeof(buf), "Distancia de visión  < %d%% >", 50 + gCfg.dist * 10); break;
               case IT_DOF: std::snprintf(buf, sizeof(buf), "Desenfoque (DoF)     < %s >", onoff[gCfg.dof]); break;
               case IT_FXAA: std::snprintf(buf, sizeof(buf), "Suavizado de bordes  < %s >", onoff[gCfg.fxaa]); break;
@@ -775,16 +754,543 @@ jobs:
               }
           }
 
+
           // ---------------------------------------------------------------------------------------------
-          int main(int argc, char **argv)
+          // Importador de discos GameCube (.gcm / .iso): extrae los archivos al formato de carpeta que lee el nucleo
+          // (el mismo que "Extract Entire Disc" de Dolphin y port/tools/whole_disc_folder.py):
+          //     data/disc0/sys/{boot.bin,bi2.bin,apploader.img,main.dol,fst.bin}   data/disc0/files/...   (disco 1)
+          //     data/disc1/...                                                                                (disco 2)
+          // ---------------------------------------------------------------------------------------------
+          static uint32_t be32(const uint8_t *p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
+
+          struct DiscImage {
+              std::string path, file, id;
+              int number = -1;
+              uint64_t size = 0;
+              uint8_t hdr[0x440];
+              uint32_t dolOff = 0, fstOff = 0, fstSize = 0;
+          };
+
+          struct Ent { bool dir; std::string path; uint32_t off, size; };
+
+          static bool readAt(FILE *f, uint64_t off, void *buf, size_t n)
           {
-              (void)argc;
-              (void)argv;
+              if (n == 0) return true;
+              if (fseeko(f, (off_t)off, SEEK_SET) != 0) return false;
+              return std::fread(buf, 1, n, f) == n;
+          }
+
+          static std::string humanSize(uint64_t b)
+          {
+              char buf[48];
+              if (b >= (1ull << 30)) std::snprintf(buf, sizeof(buf), "%.2f GB", b / 1073741824.0);
+              else std::snprintf(buf, sizeof(buf), "%.1f MB", b / 1048576.0);
+              return buf;
+          }
+
+          static std::string releaseName(const std::string &id)
+          {
+              if (id == "G4BE08") return "prototipo debug o edición USA";
+              if (id == "G4BP08") return "edición europea";
+              if (id == "G4BJ08") return "edición japonesa";
+              return "edición no compatible";
+          }
+
+          static bool supportedId(const std::string &id) { return id == "G4BE08" || id == "G4BP08" || id == "G4BJ08"; }
+
+          static bool probeDisc(const std::string &path, DiscImage &d, std::string &err)
+          {
+              d.path = path;
+              size_t sl = path.find_last_of('/');
+              d.file = sl == std::string::npos ? path : path.substr(sl + 1);
+              FILE *f = std::fopen(path.c_str(), "rb");
+              if (!f) { err = "no se puede abrir: " + std::string(std::strerror(errno)); return false; }
+              fseeko(f, 0, SEEK_END);
+              d.size = (uint64_t)ftello(f);
+              bool ok = readAt(f, 0, d.hdr, sizeof(d.hdr));
+              std::fclose(f);
+              if (!ok) { err = "archivo demasiado corto"; return false; }
+              static const uint8_t magic[4] = {0xC2, 0x33, 0x9F, 0x3D};
+              if (std::memcmp(d.hdr + 0x1C, magic, 4) != 0) { err = "no es un disco de GameCube (.gcm/.iso)"; return false; }
+              d.id.assign((const char *)d.hdr, 6);
+              for (char c : d.id) if (c < 0x20 || c > 0x7E) { err = "identificador de disco no valido"; return false; }
+              d.number = d.hdr[6];
+              d.dolOff = be32(d.hdr + 0x420);
+              d.fstOff = be32(d.hdr + 0x424);
+              d.fstSize = be32(d.hdr + 0x428);
+              if (d.fstSize < 12 || d.fstSize > 64u * 1024 * 1024) { err = "tabla de archivos (FST) fuera de limites"; return false; }
+              if ((uint64_t)d.fstOff + d.fstSize > d.size || (uint64_t)d.dolOff + 0x100 > d.size) { err = "disco recortado o danado"; return false; }
+              return true;
+          }
+
+          static bool parseFst(const std::vector<uint8_t> &d, uint64_t imgSize, std::vector<Ent> &out, std::string &err)
+          {
+              if (d.size() < 12) { err = "FST vacio"; return false; }
+              uint32_t flags = be32(d.data()), parent = be32(d.data() + 4), count = be32(d.data() + 8);
+              if (flags != 0x01000000 || parent != 0 || count < 1 || count > d.size() / 12) { err = "FST: raiz o cantidad no validas"; return false; }
+              const uint8_t *names = d.data() + 12 * (size_t)count;
+              size_t namesLen = d.size() - 12 * (size_t)count;
+              struct Lvl { std::string path; uint32_t end, idx; };
+              std::vector<Lvl> stack;
+              stack.push_back({"", count, 0});
+              std::set<std::string> seen;
+              for (uint32_t i = 1; i < count; i++) {
+                  while (i >= stack.back().end) {
+                      stack.pop_back();
+                      if (stack.empty()) { err = "FST: jerarquia no valida"; return false; }
+                  }
+                  const uint8_t *e = d.data() + 12 * (size_t)i;
+                  uint32_t fn = be32(e), a = be32(e + 4), b = be32(e + 8);
+                  uint32_t flag = fn >> 24, nameOff = fn & 0xFFFFFF;
+                  if (flag > 1 || nameOff >= namesLen) { err = "FST: tipo o nombre no validos"; return false; }
+                  size_t end = nameOff;
+                  while (end < namesLen && names[end] != 0) end++;
+                  if (end >= namesLen) { err = "FST: nombre sin terminar"; return false; }
+                  std::string name((const char *)names + nameOff, end - nameOff);
+                  if (name.empty() || name == "." || name == ".." || name.find_first_of("/\\:") != std::string::npos) { err = "FST: nombre inseguro"; return false; }
+                  std::string path = stack.back().path + (stack.back().path.empty() ? "" : "/") + name;
+                  std::string low = path;
+                  for (char &c : low) if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+                  if (!seen.insert(low).second) { err = "FST: ruta ambigua (mayusculas/minusculas): " + path; return false; }
+                  if (flag) {
+                      if (a != stack.back().idx || !(i < b && b <= stack.back().end)) { err = "FST: rango de carpeta no valido"; return false; }
+                      stack.push_back({path, b, i});
+                      out.push_back({true, path, 0, 0});
+                  } else {
+                      if ((uint64_t)a > imgSize || (uint64_t)b > imgSize - a) { err = "FST: archivo fuera del disco: " + path; return false; }
+                      out.push_back({false, path, a, b});
+                  }
+              }
+              return true;
+          }
+
+          static bool mkdirs(const std::string &path)
+          {
+              for (size_t i = 1; i <= path.size(); i++)
+                  if (i == path.size() || path[i] == '/') {
+                      std::string p = path.substr(0, i);
+                      if (mkdir(p.c_str(), 0777) != 0 && errno != EEXIST) return false;
+                  }
+              return true;
+          }
+
+          struct ImportJob {
+              std::atomic<uint64_t> done{0}, total{0};
+              std::atomic<int> state{0};     // 0 sin empezar, 1 en curso, 2 terminado, 3 error, 4 cancelado
+              std::atomic<int> discNo{0};
+              std::atomic<bool> cancel{false};
+              std::string current, error;    // (se leen solo cuando state != 1, o con cuidado: es solo texto de ayuda)
+              std::atomic<int> filesDone{0}, filesTotal{0};
+              char cur[160] = {0};
+          };
+
+          static bool copySpan(FILE *src, uint64_t off, uint64_t size, const std::string &dst, ImportJob &job, std::string &err)
+          {
+              std::string tmp = dst + ".part";
+              FILE *o = std::fopen(tmp.c_str(), "wb");
+              if (!o) { err = "no puedo crear " + dst + ": " + std::strerror(errno); return false; }
+              std::vector<uint8_t> buf(1 << 20);
+              uint64_t left = size, pos = off;
+              while (left) {
+                  if (job.cancel) { std::fclose(o); std::remove(tmp.c_str()); err = "cancelado"; return false; }
+                  size_t n = (size_t)std::min<uint64_t>(left, buf.size());
+                  if (!readAt(src, pos, buf.data(), n)) { std::fclose(o); std::remove(tmp.c_str()); err = "lectura corta del disco en " + dst; return false; }
+                  if (std::fwrite(buf.data(), 1, n, o) != n) { std::fclose(o); std::remove(tmp.c_str()); err = "no se pudo escribir (¿sin espacio?): " + dst; return false; }
+                  pos += n; left -= n; job.done += n;
+              }
+              if (std::fclose(o) != 0) { std::remove(tmp.c_str()); err = "error al cerrar " + dst; return false; }
+              if (std::rename(tmp.c_str(), dst.c_str()) != 0) { err = "no pude renombrar " + dst; return false; }
+              return true;
+          }
+
+          static bool writeBytes(const std::string &dst, const uint8_t *data, size_t n, std::string &err)
+          {
+              FILE *o = std::fopen(dst.c_str(), "wb");
+              if (!o || std::fwrite(data, 1, n, o) != n) { if (o) std::fclose(o); err = "no se pudo escribir " + dst; return false; }
+              std::fclose(o);
+              return true;
+          }
+
+          struct Plan {
+              DiscImage disc;
+              std::vector<uint8_t> fst;
+              std::vector<Ent> ents;
+              uint32_t dolSize = 0, apploaderSize = 0;
+              uint64_t bytes = 0;
+          };
+
+          // Lee y valida (sin escribir nada) la cabecera, el DOL, el apploader y la FST de un disco
+          static bool planDisc(const DiscImage &d, Plan &p, std::string &err)
+          {
+              p.disc = d;
+              FILE *f = std::fopen(d.path.c_str(), "rb");
+              if (!f) { err = "no se puede abrir " + d.file; return false; }
+              bool ok = false;
+              do {
+                  p.fst.resize(d.fstSize);
+                  if (!readAt(f, d.fstOff, p.fst.data(), d.fstSize)) { err = "no pude leer la FST"; break; }
+                  if (!parseFst(p.fst, d.size, p.ents, err)) break;
+                  uint8_t dh[0x100];
+                  if (!readAt(f, d.dolOff, dh, sizeof(dh))) { err = "no pude leer el DOL"; break; }
+                  uint64_t dolSize = 0x100;
+                  bool bad = false;
+                  for (int i = 0; i < 18; i++) {
+                      uint32_t off = be32(dh + i * 4), sz = be32(dh + 0x90 + i * 4);
+                      if (sz && off < 0x100) { bad = true; break; }
+                      if ((uint64_t)d.dolOff + off > d.size || (uint64_t)sz > d.size - (d.dolOff + (uint64_t)off)) { bad = true; break; }
+                      dolSize = std::max<uint64_t>(dolSize, (uint64_t)off + sz);
+                  }
+                  if (bad) { err = "DOL no valido"; break; }
+                  p.dolSize = (uint32_t)dolSize;
+                  uint8_t ah[32];
+                  if (!readAt(f, 0x2440, ah, sizeof(ah))) { err = "no pude leer el apploader"; break; }
+                  uint64_t asz = 32 + (uint64_t)be32(ah + 20) + be32(ah + 24);
+                  if (0x2440 + asz > d.size || asz > 16u * 1024 * 1024) { err = "apploader no valido"; break; }
+                  p.apploaderSize = (uint32_t)asz;
+                  p.bytes = sizeof(d.hdr) + 0x2000 + p.apploaderSize + p.dolSize + p.fst.size();
+                  for (const Ent &e : p.ents) if (!e.dir) p.bytes += e.size;
+                  ok = true;
+              } while (0);
+              std::fclose(f);
+              return ok;
+          }
+
+          static bool importDisc(const Plan &p, const std::string &outDir, ImportJob &job, std::string &err)
+          {
+              const DiscImage &d = p.disc;
+              std::string base = outDir + "/disc" + std::to_string(d.number);
+              std::string sysd = base + "/sys", files = base + "/files";
+              if (!mkdirs(sysd) || !mkdirs(files)) { err = "no puedo crear " + base + ": " + std::strerror(errno); return false; }
+              FILE *f = std::fopen(d.path.c_str(), "rb");
+              if (!f) { err = "no se puede abrir " + d.file; return false; }
+              bool ok = false;
+              do {
+                  std::vector<uint8_t> tmp;
+                  auto sysFile = [&](const char *name, uint64_t off, size_t n) {
+                      tmp.resize(n);
+                      if (!readAt(f, off, tmp.data(), n)) { err = std::string("lectura corta: ") + name; return false; }
+                      if (!writeBytes(sysd + "/" + name, tmp.data(), n, err)) return false;
+                      job.done += n;
+                      return true;
+                  };
+                  std::snprintf(job.cur, sizeof(job.cur), "sys/");
+                  if (!sysFile("boot.bin", 0, 0x440) || !sysFile("bi2.bin", 0x440, 0x2000) || !sysFile("apploader.img", 0x2440, p.apploaderSize) ||
+                      !sysFile("main.dol", d.dolOff, p.dolSize))
+                      break;
+                  if (!writeBytes(sysd + "/fst.bin", p.fst.data(), p.fst.size(), err)) break;
+                  job.done += p.fst.size();
+                  bool fail = false;
+                  for (const Ent &e : p.ents) {
+                      if (e.dir) {
+                          if (!mkdirs(files + "/" + e.path)) { err = "no puedo crear la carpeta " + e.path; fail = true; break; }
+                          continue;
+                      }
+                      std::snprintf(job.cur, sizeof(job.cur), "%s", e.path.c_str());
+                      if (!copySpan(f, e.off, e.size, files + "/" + e.path, job, err)) { fail = true; break; }
+                      job.filesDone++;
+                  }
+                  if (fail) break;
+                  ok = true;
+              } while (0);
+              std::fclose(f);
+              return ok;
+          }
+
+          static void importThread(std::vector<Plan> *plans, std::string outDir, ImportJob *job)
+          {
+              job->state = 1;
+              std::string err;
+              for (const Plan &p : *plans) {
+                  job->discNo = p.disc.number + 1;
+                  if (!importDisc(p, outDir, *job, err)) {
+                      job->error = err;
+                      job->state = job->cancel ? 4 : 3;
+                      return;
+                  }
+              }
+              // marca de importacion terminada
+              std::string marker;
+              for (const Plan &p : *plans)
+                  marker += "disc" + std::to_string(p.disc.number) + "=" + p.disc.file + " " + p.disc.id + " " + std::to_string(p.disc.size) + "\n";
+              if (!writeBytes(outDir + "/import.ok", (const uint8_t *)marker.data(), marker.size(), err)) { job->error = err; job->state = 3; return; }
+              job->state = 2;
+          }
+
+          static bool fileExists(const std::string &p)
+          {
+              struct stat st;
+              return stat(p.c_str(), &st) == 0;
+          }
+
+          static std::string lowerExt(const std::string &n)
+          {
+              size_t dot = n.find_last_of('.');
+              if (dot == std::string::npos) return "";
+              std::string e = n.substr(dot);
+              for (char &c : e) if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+              return e;
+          }
+
+
+          // ---------------------------------------------------------------------------------------------
+          // Juego: nucleo (libre4_main.so), renderizador GX -> GLES, audio y mando
+          // ---------------------------------------------------------------------------------------------
+          struct CoreApi {
+              void *lib = nullptr;
+              decltype(&re4_core_reserve) reserve = nullptr;
+              decltype(&re4_core_start) start = nullptr;
+              decltype(&re4_core_state) state = nullptr;
+              decltype(&re4_core_message) message = nullptr;
+              decltype(&re4_core_pad) pad = nullptr;
+              decltype(&re4_core_audio) audio = nullptr;
+              decltype(&re4_core_gx_acquire) gxAcquire = nullptr;
+              decltype(&re4_core_gx_release) gxRelease = nullptr;
+              decltype(&re4_core_vsync) vsync = nullptr;
+              decltype(&re4_core_pause) pause = nullptr;
+              decltype(&re4_core_set_potato) setPotato = nullptr;
+              decltype(&re4_core_set_view_distance) setViewDistance = nullptr;
+              decltype(&re4_core_set_dof) setDof = nullptr;
+              decltype(&re4_core_debug_menu) debugMenu = nullptr;
+              decltype(&re4_core_disc_problem) discProblem = nullptr;
+          };
+          static CoreApi gApi;
+          static std::unique_ptr<re4gx::GxRenderer> gGx;
+          static SDL_AudioDeviceID gAudio = 0;
+
+          template <class F>
+          static bool bindSym(F &slot, const char *name, std::string &err, bool required)
+          {
+              slot = reinterpret_cast<F>(dlsym(gApi.lib, name));
+              if (!slot && required) { err = std::string("falta ") + name + " en libre4_main.so"; return false; }
+              return true;
+          }
+
+          static std::string exeDir()
+          {
+              char buf[PATH_MAX];
+              ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+              if (n <= 0) return ".";
+              buf[n] = 0;
+              return dirname(buf);
+          }
+
+          static bool loadCore(std::string &err)
+          {
+              if (gApi.lib) return true;
+              std::string path = exeDir() + "/libre4_main.so";
+              gApi.lib = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+              if (!gApi.lib) { err = std::string("no pude cargar libre4_main.so: ") + dlerror(); return false; }
+              return bindSym(gApi.reserve, "re4_core_reserve", err, true) && bindSym(gApi.start, "re4_core_start", err, true) &&
+                     bindSym(gApi.state, "re4_core_state", err, true) && bindSym(gApi.message, "re4_core_message", err, true) &&
+                     bindSym(gApi.pad, "re4_core_pad", err, true) && bindSym(gApi.audio, "re4_core_audio", err, true) &&
+                     bindSym(gApi.gxAcquire, "re4_core_gx_acquire", err, true) && bindSym(gApi.gxRelease, "re4_core_gx_release", err, true) &&
+                     bindSym(gApi.vsync, "re4_core_vsync", err, false) && bindSym(gApi.pause, "re4_core_pause", err, false) &&
+                     bindSym(gApi.setPotato, "re4_core_set_potato", err, false) &&
+                     bindSym(gApi.setViewDistance, "re4_core_set_view_distance", err, false) &&
+                     bindSym(gApi.setDof, "re4_core_set_dof", err, false) && bindSym(gApi.debugMenu, "re4_core_debug_menu", err, false) &&
+                     bindSym(gApi.discProblem, "re4_core_disc_problem", err, false);
+          }
+
+          // calidad -> mascara "potato" del nucleo: bit 0 sin clima, bit 1 sin efectos especiales,
+          // bits 2-3 particulas (1 menos, 2 ninguna), bit 4 sin sombras ni efectos de luz
+          static int potatoMask(int quality)
+          {
+              static const int m[4] = {0, 1 | (1 << 2), 1 | 2 | (1 << 2) | 16, 1 | 2 | (2 << 2) | 16};
+              return m[std::clamp(quality, 0, 3)];
+          }
+
+          static void applyCore()
+          {
+              if (gApi.setPotato) gApi.setPotato(potatoMask(gCfg.quality));
+              if (gApi.setViewDistance) gApi.setViewDistance(50 + gCfg.dist * 10);
+              if (gApi.setDof) gApi.setDof(gCfg.dof);
+              if (gGx) {
+                  gGx->SetFxaa(gCfg.fxaa != 0);
+                  gGx->RescaleHalves(2 + gCfg.scale);
+              }
+          }
+
+          static void audioCb(void *, Uint8 *stream, int len)
+          {
+              int frames = len / 4;
+              int got = gApi.audio ? gApi.audio((int16_t *)stream, frames) : 0;
+              if (got < 0) got = 0;
+              if (got < frames) std::memset(stream + (size_t)got * 4, 0, (size_t)(frames - got) * 4);
+          }
+
+          static void openAudio()
+          {
+              SDL_AudioSpec want;
+              std::memset(&want, 0, sizeof(want));
+              want.freq = 32000;
+              want.format = AUDIO_S16SYS;
+              want.channels = 2;
+              want.samples = 1024;
+              want.callback = audioCb;
+              gAudio = SDL_OpenAudioDevice(nullptr, 0, &want, nullptr, 0);  // sin "obtained": SDL convierte al formato del equipo
+              if (!gAudio) { std::printf("[audio] no pude abrir el audio: %s (el juego sigue sin sonido)\n", SDL_GetError()); return; }
+              SDL_PauseAudioDevice(gAudio, 0);
+              std::printf("[audio] abierto: 32000 Hz estereo, %d muestras (driver %s)\n", want.samples, SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "?");
+          }
+
+          static bool startGame(std::string &err)
+          {
+              if (!loadCore(err)) return false;
+              char cwd[PATH_MAX];
+              if (!getcwd(cwd, sizeof(cwd))) { err = "no pude leer la carpeta actual"; return false; }
+              std::string dataDir = std::string(cwd) + "/data", moduleDir = exeDir() + "/modules";
+              std::printf("[juego] reservando memoria; datos=%s modulos=%s\n", dataDir.c_str(), moduleDir.c_str());
+              if (!gApi.reserve(dataDir.c_str(), moduleDir.c_str())) {
+                  const char *m = gApi.message ? gApi.message() : nullptr;
+                  err = std::string("reserva de memoria: ") + (m ? m : "sin detalle");
+                  return false;
+              }
+              applyCore();
+              if (!gApi.start()) {
+                  const char *m = gApi.message ? gApi.message() : nullptr;
+                  err = std::string("arranque del nucleo: ") + (m ? m : "sin detalle");
+                  return false;
+              }
+              std::printf("[juego] nucleo en marcha (estado %d)\n", gApi.state());
+              openAudio();
+              return true;
+          }
+
+          static bool initGx(std::string &err)
+          {
+              gGx = std::make_unique<re4gx::GxRenderer>(re4gx::GxApi::kGl);
+              re4gx::GxOptions o;
+              gGx->SetOptions(o);
+              const char *cache = std::getenv("RE4_GX_PROGRAM_CACHE");
+              if (cache && *cache) {
+                  mkdir(cache, 0777);
+                  gGx->SetProgramCache(cache);
+              }
+              if (!gGx->InitHalves(2 + gCfg.scale, &err)) { gGx.reset(); return false; }
+              gGx->SetFxaa(gCfg.fxaa != 0);
+              std::printf("[gx] renderizador listo (escala interna %.1fx)\n", (2 + gCfg.scale) / 2.0);
+              return true;
+          }
+
+          // muestra la ultima imagen que dejo el juego en la pantalla (16:9 como la app, o 4:3 original)
+          static bool drawPicture(int gw, int gh)
+          {
+              unsigned xw = 0, xh = 0;
+              if (!gGx || !gGx->Xfb(&xw, &xh)) return false;
+              if (gCfg.aspect == 0) {
+                  int bw = gw, bh = gw * 9 / 16;
+                  if (bh > gh) { bh = gh; bw = gh * 16 / 9; }
+                  gGx->Present((gw - bw) / 2, (gh - bh) / 2, bw, bh, xh * 56 / 448, xh * 336 / 448);
+              } else {
+                  int bw = gw, bh = gw * 3 / 4;
+                  if (bh > gh) { bh = gh; bw = gh * 4 / 3; }
+                  gGx->Present((gw - bw) / 2, (gh - bh) / 2, bw, bh);
+              }
+              return true;
+          }
+
+          static int8_t clampS8(int v, int lim) { return (int8_t)std::max(-lim, std::min(lim, v)); }
+
+          // botones de SDL -> mando de GameCube (A/B/X/Y como estan, Z = R1, L/R = gatillos L2/R2, palanca C = palanca derecha)
+          static Re4CorePad makePad(bool neutral, bool maskStart)
+          {
+              Re4CorePad p;
+              std::memset(&p, 0, sizeof(p));
+              if (neutral) return p;
+              unsigned b = 0;
+              if (padButton(SDL_CONTROLLER_BUTTON_DPAD_LEFT)) b |= 0x0001;
+              if (padButton(SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) b |= 0x0002;
+              if (padButton(SDL_CONTROLLER_BUTTON_DPAD_DOWN)) b |= 0x0004;
+              if (padButton(SDL_CONTROLLER_BUTTON_DPAD_UP)) b |= 0x0008;
+              if (padButton(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)) b |= 0x0010;  // Z
+              if (padButton(SDL_CONTROLLER_BUTTON_A)) b |= 0x0100;
+              if (padButton(SDL_CONTROLLER_BUTTON_B)) b |= 0x0200;
+              if (padButton(SDL_CONTROLLER_BUTTON_X)) b |= 0x0400;
+              if (padButton(SDL_CONTROLLER_BUTTON_Y)) b |= 0x0800;
+              if (padButton(SDL_CONTROLLER_BUTTON_START) && !maskStart) b |= 0x1000;
+              int tl = std::max(0, padAxis(SDL_CONTROLLER_AXIS_TRIGGERLEFT)) >> 7;
+              int tr = std::max(0, padAxis(SDL_CONTROLLER_AXIS_TRIGGERRIGHT)) >> 7;
+              if (padButton(SDL_CONTROLLER_BUTTON_LEFTSHOULDER)) tl = 255;
+              if (tl > 150) b |= 0x0040;  // L
+              if (tr > 150) b |= 0x0020;  // R
+              p.buttons = (uint16_t)b;
+              p.triggerL = (uint8_t)std::min(255, tl);
+              p.triggerR = (uint8_t)std::min(255, tr);
+              p.stickX = clampS8(padAxis(SDL_CONTROLLER_AXIS_LEFTX) * 100 / 32767, 100);
+              p.stickY = clampS8(-padAxis(SDL_CONTROLLER_AXIS_LEFTY) * 100 / 32767, 100);
+              p.substickX = clampS8(padAxis(SDL_CONTROLLER_AXIS_RIGHTX) * 90 / 32767, 90);
+              p.substickY = clampS8(-padAxis(SDL_CONTROLLER_AXIS_RIGHTY) * 90 / 32767, 90);
+              return p;
+          }
+
+          // Busca los discos en assets/ y los valida (no escribe nada)
+          static void scanAssets(std::vector<Plan> &plans, std::vector<std::string> &msgs)
+          {
+              plans.clear();
+              msgs.clear();
+              std::vector<std::string> cands, rvz;
+              DIR *dir = opendir("assets");
+              if (!dir) { msgs.push_back("No existe la carpeta assets/ (pon aquí tus dos discos .gcm o .iso)"); return; }
+              while (dirent *e = readdir(dir)) {
+                  std::string n = e->d_name, x = lowerExt(n);
+                  if (x == ".gcm" || x == ".iso") cands.push_back("assets/" + n);
+                  else if (x == ".rvz") rvz.push_back(n);
+              }
+              closedir(dir);
+              std::sort(cands.begin(), cands.end());
+              Plan byNum[2];
+              bool have[2] = {false, false};
+              for (const std::string &c : cands) {
+                  DiscImage d;
+                  std::string err;
+                  if (!probeDisc(c, d, err)) { msgs.push_back(d.file + ": " + err); continue; }
+                  if (!supportedId(d.id)) { msgs.push_back(d.file + ": " + d.id + " no es una edición compatible"); continue; }
+                  if (d.number < 0 || d.number > 1) { msgs.push_back(d.file + ": número de disco no válido"); continue; }
+                  if (have[d.number]) { msgs.push_back(d.file + ": ya hay otro archivo del disco " + std::to_string(d.number + 1)); continue; }
+                  Plan pl;
+                  if (!planDisc(d, pl, err)) { msgs.push_back(d.file + ": " + err); continue; }
+                  byNum[d.number] = pl;
+                  have[d.number] = true;
+              }
+              if (!rvz.empty()) msgs.push_back("Hay archivos .rvz: todavía no se pueden leer (próxima etapa); usa .gcm o .iso por ahora");
+              if (have[0] && have[1]) {
+                  if (byNum[0].disc.id != byNum[1].disc.id) msgs.push_back("Los dos discos son de ediciones distintas");
+                  else { plans.push_back(byNum[0]); plans.push_back(byNum[1]); }
+              } else {
+                  if (!have[0]) msgs.push_back("Falta el disco 1 (.gcm o .iso) en assets/");
+                  if (!have[1]) msgs.push_back("Falta el disco 2 (.gcm o .iso) en assets/");
+              }
+          }
+
+          // Modo sin ventana:  re4_emu --import <carpeta_salida> <disco1> <disco2>   (para pruebas y diagnostico)
+          static int cliImport(const char *out, int n, char **imgs)
+          {
+              std::vector<Plan> plans;
+              for (int i = 0; i < n; i++) {
+                  DiscImage d;
+                  std::string err;
+                  Plan p;
+                  if (!probeDisc(imgs[i], d, err) || !planDisc(d, p, err)) { std::printf("ERROR %s: %s\n", imgs[i], err.c_str()); return 1; }
+                  std::printf("%s: %s disco %d, %zu entradas, %s\n", d.file.c_str(), d.id.c_str(), d.number + 1, p.ents.size(), humanSize(p.bytes).c_str());
+                  plans.push_back(p);
+              }
+              std::sort(plans.begin(), plans.end(), [](const Plan &a, const Plan &b) { return a.disc.number < b.disc.number; });
+              ImportJob job;
+              for (const Plan &p : plans) job.total += p.bytes;
+              importThread(&plans, out, &job);
+              std::printf("estado=%d copiado=%s de %s %s\n", (int)job.state, humanSize(job.done).c_str(), humanSize(job.total).c_str(), job.error.c_str());
+              return job.state == 2 ? 0 : 1;
+          }
+
+          // ---------------------------------------------------------------------------------------------
+          static int emuMain(int argc, char **argv)
+          {
               std::setvbuf(stdout, nullptr, _IOLBF, 0);
+              if (argc >= 4 && !std::strcmp(argv[1], "--import")) return cliImport(argv[2], argc - 3, argv + 3);
               std::printf("== re4_emu (CubeEvil4 para EmuELEC, etapa 2a: ventana + mando + menu) ==\n");
               loadCfg();
 
-              if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_JOYSTICK | SDL_INIT_TIMER) != 0) {
+              if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER | SDL_INIT_JOYSTICK | SDL_INIT_TIMER) != 0) {
                   std::printf("ERROR: SDL_Init: %s\n", SDL_GetError());
                   return 2;
               }
@@ -815,7 +1321,6 @@ jobs:
                   ctx = SDL_GL_CreateContext(win);
               }
               if (!ctx) { std::printf("ERROR: SDL_GL_CreateContext: %s\n", SDL_GetError()); SDL_DestroyWindow(win); SDL_Quit(); return 4; }
-              if (!loadGL()) { std::printf("ERROR: faltan funciones de GL\n"); return 5; }
               SDL_GL_SetSwapInterval(1);
               int gw = ww, gh = wh;
               SDL_GL_GetDrawableSize(win, &gw, &gh);
@@ -838,6 +1343,51 @@ jobs:
               const int shotFrame = std::getenv("RE4_EMU_SHOT_FRAME") ? std::atoi(std::getenv("RE4_EMU_SHOT_FRAME")) : 45;
               const bool autoMenu = std::getenv("RE4_EMU_AUTOMENU") != nullptr;
 
+              // --- estado de la importacion de discos
+              enum Screen { SC_STATUS, SC_CONFIRM, SC_IMPORT, SC_LOADING, SC_GAME };
+              int screen = SC_STATUS;
+              std::vector<Plan> plans;
+              std::vector<std::string> importMsgs;
+              ImportJob job;
+              std::thread importTh;
+              bool imported = fileExists("data/import.ok") || (fileExists("data/disc0/sys/boot.bin") && fileExists("data/disc1/sys/boot.bin"));
+              std::string importInfo;
+              uint64_t freeBytes = 0, needBytes = 0;
+              double importStart = 0;
+              {
+                  struct statvfs sv;
+                  if (statvfs(".", &sv) == 0) freeBytes = (uint64_t)sv.f_bavail * sv.f_frsize;
+                  if (imported) {
+                      FILE *mf = std::fopen("data/import.ok", "r");
+                      char ln[200];
+                      if (mf && std::fgets(ln, sizeof(ln), mf)) {
+                          const char *sp = std::strchr(ln, ' ');
+                          if (sp) importInfo = std::string(sp + 1, std::min<size_t>(6, std::strlen(sp + 1)));
+                      }
+                      if (mf) std::fclose(mf);
+                      if (importInfo.empty()) {
+                          FILE *bf = std::fopen("data/disc0/sys/boot.bin", "rb");
+                          char id[7] = {0};
+                          if (bf && std::fread(id, 1, 6, bf) == 6) importInfo = id;
+                          if (bf) std::fclose(bf);
+                      }
+                      std::printf("discos ya importados en data/ (%s)\n", importInfo.c_str());
+                  } else {
+                      scanAssets(plans, importMsgs);
+                      for (const std::string &m : importMsgs) std::printf("[discos] %s\n", m.c_str());
+                      if (plans.size() == 2) {
+                          for (const Plan &pl : plans) needBytes += pl.bytes;
+                          std::printf("[discos] listos para importar: %s + %s (%s), hacen falta %s, libres %s\n", plans[0].disc.file.c_str(),
+                                      plans[1].disc.file.c_str(), plans[0].disc.id.c_str(), humanSize(needBytes).c_str(), humanSize(freeBytes).c_str());
+                          screen = SC_CONFIRM;
+                      }
+                  }
+              }
+
+              bool startRequested = imported && std::getenv("RE4_EMU_AUTOSTART") != nullptr;
+              int startStage = 0;
+              bool gameRan = false, gameDead = false, menuPaused = false, selDebugFired = false;
+              double lastStatLog = 0;
               bool prev[B_COUNT] = {false}, cur[B_COUNT] = {false};
               bool menuOpen = false, quit = false;
               int sel = 0;
@@ -866,6 +1416,59 @@ jobs:
                   readInput(cur);
                   auto edge = [&](Btn b) { return cur[b] && !prev[b]; };
 
+                  if (screen == SC_CONFIRM) {
+                      if (edge(B_A)) {
+                          if (freeBytes < needBytes + (100ull << 20)) {
+                              importMsgs.push_back("No hay espacio suficiente: faltan " + humanSize(needBytes + (100ull << 20) - freeBytes));
+                              screen = SC_STATUS;
+                          } else {
+                              job.total = needBytes;
+                              importStart = now;
+                              importTh = std::thread(importThread, &plans, std::string("data"), &job);
+                              screen = SC_IMPORT;
+                              std::printf("[importar] empieza\n");
+                          }
+                      }
+                      if (edge(B_B)) { screen = SC_STATUS; std::printf("[importar] omitido por el usuario\n"); }
+                  } else if (screen == SC_IMPORT) {
+                      if (edge(B_B)) job.cancel = true;
+                      if (job.state >= 2) {
+                          importTh.join();
+                          if (job.state == 2) {
+                              imported = true;
+                              importInfo = plans[0].disc.id;
+                              std::printf("[importar] terminado (%.0f s)\n", now - importStart);
+                          } else {
+                              importMsgs.push_back(job.state == 4 ? "Importación cancelada" : "Error al importar: " + job.error);
+                              std::printf("[importar] %s\n", importMsgs.back().c_str());
+                          }
+                          screen = SC_STATUS;
+                      }
+                  }
+
+                  // --- arrancar el juego (START en la pantalla de estado, o solo si el lanzador lo pide)
+                  if (screen == SC_STATUS && imported && !gameDead && (startRequested || (edge(B_START) && !cur[B_SELECT] && !cur[B_GUIDE]))) {
+                      startRequested = false;
+                      screen = SC_LOADING;
+                      startStage = 0;
+                  } else if (screen == SC_LOADING) {
+                      if (startStage == 0) startStage = 1;  // primero se dibuja un cuadro con el aviso, luego se bloquea cargando
+                      else {
+                          std::string err;
+                          bool ok = startGame(err) && initGx(err);
+                          if (!ok) {
+                              importMsgs.push_back("No pude iniciar el juego: " + err);
+                              std::printf("[juego] ERROR: %s\n", err.c_str());
+                              gameDead = true;
+                              screen = SC_STATUS;
+                          } else {
+                              screen = SC_GAME;
+                              gameRan = true;
+                              std::printf("[juego] en pantalla\n");
+                          }
+                      }
+                  }
+
                   // --- salir: SELECT (o GUIA) + START mantenidos 1,5 s
                   bool combo = (cur[B_SELECT] || cur[B_GUIDE]) && cur[B_START];
                   if (combo) {
@@ -874,14 +1477,24 @@ jobs:
                   } else comboStart = -1;
 
                   // --- SELECT: pulsar = menu, mantener = menu de depuracion del juego (aun no conectado)
-                  if (edge(B_SELECT)) { lastSelDown = now; selCombo = false; selLongShown = false; }
+                  if (edge(B_SELECT)) { lastSelDown = now; selCombo = false; selLongShown = false; selDebugFired = false; }
                   if (cur[B_SELECT] && cur[B_START]) selCombo = true;
                   if (cur[B_SELECT] && lastSelDown >= 0 && now - lastSelDown >= 1.0 && !selCombo) selLongShown = true;
-                  if (!cur[B_SELECT] && prev[B_SELECT] && !selCombo) {
+                  if (!cur[B_SELECT] && prev[B_SELECT] && !selCombo && (screen == SC_STATUS || screen == SC_GAME)) {
                       if (now - lastSelDown < 1.0) { menuOpen = !menuOpen; if (menuOpen) sel = 0; if (!menuOpen) saveCfg(); }
                   }
-                  if (edge(B_R3)) { menuOpen = !menuOpen; if (menuOpen) sel = 0; if (!menuOpen) saveCfg(); }
-                  if (autoMenu && frames == 10) menuOpen = true;
+                  if (screen == SC_GAME && selLongShown && !selDebugFired && !menuOpen) {
+                      selDebugFired = true;
+                      std::printf("[juego] SELECT mantenido: menu de depuracion del juego\n");
+                      if (gApi.debugMenu) gApi.debugMenu();
+                  }
+                  if (edge(B_R3) && (screen == SC_STATUS || screen == SC_GAME)) { menuOpen = !menuOpen; if (menuOpen) sel = 0; if (!menuOpen) saveCfg(); }
+                  if (autoMenu && frames == 10 && screen == SC_STATUS) menuOpen = true;
+                  if (screen == SC_GAME && menuOpen != menuPaused) {  // el juego se detiene con el menu abierto
+                      if (gApi.pause) gApi.pause(menuOpen ? 1 : 0, menuOpen ? 300 : 0);
+                      menuPaused = menuOpen;
+                      if (!menuOpen) applyCore();
+                  }
 
                   // --- navegacion del menu (con repeticion al mantener izquierda/derecha/arriba/abajo)
                   if (menuOpen) {
@@ -908,22 +1521,104 @@ jobs:
                   // --- fin automatico de prueba
                   if (testSeconds > 0 && now >= testSeconds) { std::printf("fin automatico (%d s)\n", testSeconds); quit = true; }
 
+                  // --- el juego: mando -> nucleo, imagenes del nucleo -> renderizador
+                  bool pictureShown = false;
+                  if (screen == SC_GAME) {
+                      Re4CorePad pd = makePad(menuOpen, cur[B_SELECT] || cur[B_GUIDE]);
+                      gApi.pad(&pd);
+                      int ran = 0;
+                      while (ran < 64) {
+                          const Re4GxChunk *c = gApi.gxAcquire();
+                          if (!c) break;
+                          gGx->Run(*c);
+                          gApi.gxRelease(c);
+                          ran++;
+                      }
+                      if (!ran) gGx->Prewarm(2.0);
+                      int st = gApi.state();
+                      if (st == RE4_CORE_FAILED || st == RE4_CORE_ENDED) {
+                          const char *m = gApi.message ? gApi.message() : nullptr;
+                          importMsgs.push_back(std::string("El juego se detuvo: ") + (m ? m : "sin detalle"));
+                          std::printf("[juego] el nucleo se detuvo (estado %d): %s\n", st, m ? m : "-");
+                          gameDead = true;
+                          screen = SC_STATUS;
+                      }
+                      if (now - lastStatLog >= 5.0 && gGx) {
+                          lastStatLog = now;
+                          const re4gx::GxStats &g = gGx->Stats();
+                          std::printf("[gx] t=%.0fs fps=%.0f chunks=%u draws=%u triangulos=%u programas=%u (de cache %u) texturas=%u errores_shader=%u sin_textura=%u estado_nucleo=%d\n",
+                                      now, fpsVal, g.chunks, g.draws, g.triangles, g.programs, g.programsLoaded, g.textures, g.shaderErrors, g.missingTextures, st);
+                      }
+                  }
+
                   // --- dibujo
+                  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                  glDisable(GL_SCISSOR_TEST);
+                  glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
                   glViewport(0, 0, gw, gh);
                   glClearColor(0, 0, 0, 1);
                   glClear(GL_COLOR_BUFFER_BIT);
+                  if (screen == SC_GAME) pictureShown = drawPicture(gw, gh);
                   glViewport(vx, vy, vw, vh);
-                  glEnable(GL_BLEND);
-                  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-
-                  rect(0, 0, kCanvasW, kCanvasH, {12, 16, 30, 255});
-                  rect(0, 0, kCanvasW, 36, {150, 20, 20, 255});
-                  text("CubeEvil4 para EmuELEC", 12, 6, 2, {255, 255, 255, 255});
+                  const bool inGame = (screen == SC_GAME);
+                  if (!inGame) {
+                      rect(0, 0, kCanvasW, kCanvasH, {12, 16, 30, 255});
+                      rect(0, 0, kCanvasW, 36, {150, 20, 20, 255});
+                      text("CubeEvil4 para EmuELEC", 12, 6, 2, {255, 255, 255, 255});
+                  }
 
                   char line[200];
                   float y = 50;
-                  auto put = [&](const std::string &s, Col c = {220, 225, 235, 255}) { text(s, 14, y, 1, c); y += 18; };
-                  put("Etapa 2a: prueba de ventana, mando y menú (sin juego todavía)", {255, 210, 90, 255});
+                  auto put = [&](const std::string &s, Col c = {220, 225, 235, 255}) {
+                      const size_t W = 76;  // ancho de la pantalla en letras: los textos largos pasan a la linea siguiente
+                      size_t pos = 0;
+                      do {
+                          size_t end = std::min(s.size(), pos + W);
+                          while (end < s.size() && (s[end] & 0xC0) == 0x80) end--;  // no cortar una letra UTF-8 por la mitad
+                          text(s.substr(pos, end - pos), 14, y, 1, c);
+                          y += 18;
+                          pos = end;
+                      } while (pos < s.size());
+                  };
+                  auto bar = [&](float x, float by, float w, float frac) {
+                      rect(x, by, w, 22, {0, 0, 0, 255});
+                      rect(x + 3, by + 3, (w - 6) * std::min(1.0f, std::max(0.0f, frac)), 16, {80, 200, 120, 255});
+                  };
+                  if (inGame) {
+                      if (!pictureShown) text("Esperando la primera imagen del juego...", 150, 170, 1, {255, 255, 255, 255});
+                  } else if (screen == SC_LOADING) {
+                      put("Iniciando el juego...", {255, 210, 90, 255});
+                      put("La primera vez tarda: carga el núcleo y prepara los gráficos.");
+                      put("Si no pasa de aquí, mira launcher.txt.");
+                  } else if (screen == SC_CONFIRM) {
+                      put("Importar los discos del juego", {255, 210, 90, 255});
+                      y += 6;
+                      for (const Plan &pl : plans)
+                          put("Disco " + std::to_string(pl.disc.number + 1) + ": " + pl.disc.file + "  (" + pl.disc.id + ", " + humanSize(pl.disc.size) + ")");
+                      put(std::string("Edición: ") + releaseName(plans[0].disc.id), {140, 220, 160, 255});
+                      y += 6;
+                      put("Se copiarán sus archivos a la carpeta data/ del port:");
+                      put("  hacen falta " + humanSize(needBytes) + ", libres " + humanSize(freeBytes), freeBytes < needBytes ? Col{240, 150, 150, 255} : Col{220, 225, 235, 255});
+                      put("  (tarda unos minutos; solo se hace una vez)");
+                      for (const std::string &m : importMsgs) put(m, {240, 150, 150, 255});
+                      text("A: importar ahora    B: omitir por ahora    SELECT+START (1,5 s): salir", 12, 326, 1, {170, 180, 200, 255});
+                  } else if (screen == SC_IMPORT) {
+                      double done = (double)job.done, total = (double)std::max<uint64_t>(1, job.total);
+                      double el = std::max(0.1, now - importStart);
+                      put("Importando disco " + std::to_string((int)job.discNo) + " de 2", {255, 210, 90, 255});
+                      y += 6;
+                      std::string cur2 = job.cur;
+                      if (cur2.size() > 70) cur2 = "..." + cur2.substr(cur2.size() - 67);
+                      put("Archivo: " + cur2);
+                      std::snprintf(line, sizeof(line), "%.0f%%   %s de %s   %.1f MB/s", 100.0 * done / total, humanSize((uint64_t)done).c_str(),
+                                    humanSize((uint64_t)total).c_str(), done / 1048576.0 / el);
+                      put(line);
+                      bar(14, y + 6, kCanvasW - 28, (float)(done / total));
+                      y += 36;
+                      put("Archivos copiados: " + std::to_string((int)job.filesDone));
+                      text("B: cancelar    SELECT+START (1,5 s): salir", 12, 326, 1, {170, 180, 200, 255});
+                  } else {
+                  put("Etapa 2c: importación de discos, juego y mando", {255, 210, 90, 255});
                   std::snprintf(line, sizeof(line), "Video: %s %dx%d   GL: %s", SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "?", gw, gh, gs(GL_VERSION));
                   put(line);
                   put(std::string("Dibujo: ") + gs(GL_RENDERER));
@@ -941,11 +1636,15 @@ jobs:
                   float bx = (float)((std::sin(now * 2.5) + 1.0) * 0.5 * (kCanvasW - 60));
                   rect(0, 292, kCanvasW, 22, {25, 30, 50, 255});
                   rect(bx, 294, 60, 18, {80, 200, 120, 255});
-                  text("SELECT: menú   R3: menú   SELECT+START (1,5 s): salir", 12, 326, 1, {170, 180, 200, 255});
+                  if (imported) put("Discos importados en data/: " + importInfo + " (" + releaseName(importInfo) + ")", {140, 220, 160, 255});
+                  if (imported && !gameDead) put("START: jugar", {255, 210, 90, 255});
+                  for (const std::string &m : importMsgs) put(m, {240, 150, 150, 255});
+                  text("START: jugar   SELECT/R3: menú   SELECT+START (1,5 s): salir", 12, 326, 1, {170, 180, 200, 255});
+                  }
 
                   if (gCfg.fps) {
                       std::snprintf(line, sizeof(line), "%.0f FPS", fpsVal);
-                      text(line, kCanvasW - 8 * (float)std::strlen(line) - 8, 44, 1, {255, 255, 120, 255});
+                      text(line, kCanvasW - 8 * (float)std::strlen(line) - 8, inGame ? 6 : 44, 1, {255, 255, 120, 255});
                   }
                   if (comboStart >= 0) {
                       float p = (float)std::min(1.0, (now - comboStart) / 1.5);
@@ -983,8 +1682,21 @@ jobs:
                       if (s) { SDL_SaveBMP(s, shotPath); SDL_FreeSurface(s); std::printf("captura guardada: %s\n", shotPath); }
                   }
                   SDL_GL_SwapWindow(win);
+                  if (screen == SC_GAME && gApi.vsync) {
+                      struct timespec ts;
+                      clock_gettime(CLOCK_MONOTONIC, &ts);
+                      gApi.vsync((int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec);
+                  }
               }
 
+              if (gameRan) {  // el juego no se cierra con calma: se guarda lo propio y se sale
+                  saveCfg();
+                  std::printf("fin (juego)\n");
+                  std::fflush(stdout);
+                  _exit(0);
+              }
+
+              if (importTh.joinable()) { job.cancel = true; importTh.join(); }
               saveCfg();
               for (const Pad &p : gPads) SDL_GameControllerClose(p.gc);
               SDL_GL_DeleteContext(ctx);
@@ -993,16 +1705,53 @@ jobs:
               std::printf("fin\n");
               return 0;
           }
+
+          static void crashHandler(int sig)
+          {
+              void *bt[40];
+              int n = backtrace(bt, 40);
+              const char msg[] = "\n[crash] senal ";
+              if (write(2, msg, sizeof(msg) - 1) < 0) {}
+              char num[16];
+              int len = std::snprintf(num, sizeof(num), "%d\n", sig);
+              if (write(2, num, (size_t)len) < 0) {}
+              backtrace_symbols_fd(bt, n, 2);
+              _exit(128 + sig);
+          }
+
+          // el lanzador (copia de loader.c de re4_host) reserva la memoria del juego y llama aqui
+          extern "C" __attribute__((visibility("default"))) int re4_host_main(int argc, char **argv)
+          {
+              signal(SIGSEGV, crashHandler);
+              signal(SIGBUS, crashHandler);
+              signal(SIGILL, crashHandler);
+              signal(SIGFPE, crashHandler);
+              signal(SIGABRT, crashHandler);
+              return emuMain(argc, argv);
+          }
+
+          #ifdef RE4_EMU_STANDALONE
+          int main(int argc, char **argv) { return re4_host_main(argc, argv); }
+          #endif
           RE4_EMU_SRC_END
-          /opt/wrap/clang++ --target=aarch64-linux-gnu -std=c++17 -O2 -Wall \
-            -isystem /opt/sdl2dev/usr/include/SDL2 -isystem /opt/sdl2dev/usr/include -Iemu \
-            emu/re4_emu.cpp -o out/re4_emu \
-            /opt/sdl2dev/usr/lib/aarch64-linux-gnu/libSDL2-2.0.so.0 \
-            -static-libstdc++ -static-libgcc -Wl,--allow-shlib-undefined
+          SRC=port/android-decomp/app/src/main/cpp
+          /opt/wrap/clang++ --target=aarch64-linux-gnu -std=c++17 -O2 -fPIC -shared -w \
+            -Iemu -Iemu/shim -Iemu/glhdr -isystem /opt/sdl2dev/usr/include/SDL2 -isystem /opt/sdl2dev/usr/include \
+            -I$SRC -Iport/whole/runtime \
+            emu/re4_emu.cpp $SRC/gx_gl.cpp $SRC/gx_core.cpp $SRC/gx_renderer.cpp $SRC/gx_gl_shader.cpp \
+            $SRC/gx_selfcheck.cpp $SRC/gx_texture.cpp \
+            -o out/libre4_emu.so \
+            /opt/sdl2dev/usr/lib/aarch64-linux-gnu/libSDL2-2.0.so.0 emu/stubs/libGLESv2.so.2
+          file out/libre4_emu.so
+          readelf -d out/libre4_emu.so | grep -E "NEEDED" || true
+          echo "== simbolos sin resolver de libre4_emu.so (deben ser solo gl*, SDL_* y re4_*) =="
+          readelf -Ws --dyn-syms out/libre4_emu.so | awk '$7 == "UND" && $8 != "" {print $8}' | sed 's/@.*//' | grep -v -E '^(gl|SDL_)' | sort -u | head -80
+          # el lanzador: copia de loader.c de re4_host que carga libre4_emu.so en vez de libre4_host.so
+          sed 's/libre4_host\.so/libre4_emu.so/g' port/whole/host/loader.c > emu/loader_emu.c
+          grep -c "libre4_emu.so" emu/loader_emu.c
+          /opt/wrap/clang --target=aarch64-linux-gnu -O2 -Iport/whole/host -Iport/whole/runtime emu/loader_emu.c -o out/re4_emu
           file out/re4_emu
-          readelf -d out/re4_emu | grep -E "NEEDED|RUNPATH|RPATH" || true
-          echo "== GLIBC que pide re4_emu =="
-          readelf -Ws --dyn-syms out/re4_emu | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -3
+          readelf -d out/re4_emu | grep -E "NEEDED" || true
 
       - name: Cache del compilador (ccache)
         uses: actions/cache@v4
@@ -1037,9 +1786,7 @@ jobs:
           mkdir -p out/modules
           find build -maxdepth 1 -type f \( -name 'libre4_*.so*' -o -name 're4_host' \) -exec cp -v {} out/ \;
           find build/modules -type f -name 'libre4_*.so' -exec cp -v {} out/modules/ \;
-          # librerias de C++ y gcc del sysroot (gcc-8): el port las lleva consigo
-          cp -av /opt/sysroot/usr/lib/aarch64-linux-gnu/libstdc++.so.6* out/
-          cp -av /opt/sysroot/usr/lib/aarch64-linux-gnu/libgcc_s.so.1 out/
+          # (no se llevan libstdc++ ni libgcc_s: se usan las de la caja, GLIBCXX <= 3.4.25)
           cat > out/probar.sh <<'EOF'
           #!/bin/bash
           # Prueba en la caja: carga el nucleo y los modulos (no necesita discos).
@@ -1068,7 +1815,7 @@ jobs:
           find . -type f \( -name '*.so*' -o -name re4_host -o -name re4_emu \) | while read -r f; do
             readelf -Ws --dyn-syms "$f" 2>/dev/null | grep -o 'GLIBCXX_[0-9.]*'; done | sort -uV | tail -3
           echo "== librerias que pide el nucleo =="
-          readelf -d libre4_main.so re4_host libre4_host.so 2>/dev/null | grep -E "NEEDED|RUNPATH|RPATH|File:" || true
+          readelf -d libre4_main.so re4_host libre4_host.so libre4_emu.so re4_emu 2>/dev/null | grep -E "NEEDED|RUNPATH|RPATH|File:" || true
 
       - uses: actions/upload-artifact@v4
         with:
