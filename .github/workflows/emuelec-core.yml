@@ -1079,6 +1079,8 @@ jobs:
           {
               if (gApi.lib) return true;
               std::string path = exeDir() + "/libre4_main.so";
+              // dibujos fusionados (menos llamadas a la GPU por cuadro, experimental): activo salvo que exista el archivo "sin_fusion" junto al programa
+              if (access((exeDir() + "/sin_fusion").c_str(), F_OK) != 0) setenv("RE4_GX_MERGE", "1", 0);
               setenv("RE4_GX_THREADS", "2", 0);  // hilos de vertices: 2 (por defecto 1 con 4 nucleos); el lanzador puede cambiarlo
               gApi.lib = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
               if (!gApi.lib) { err = std::string("no pude cargar libre4_main.so: ") + dlerror(); return false; }
@@ -1129,7 +1131,7 @@ jobs:
               want.freq = 32000;
               want.format = AUDIO_S16SYS;
               want.channels = 2;
-              want.samples = 1024;
+              want.samples = 2048;  // el doble de colchon: menos cortes de sonido cuando una vuelta del bucle se alarga
               want.callback = audioCb;
               gAudio = SDL_OpenAudioDevice(nullptr, 0, &want, nullptr, 0);  // sin "obtained": SDL convierte al formato del equipo
               if (!gAudio) { std::printf("[audio] no pude abrir el audio: %s (el juego sigue sin sonido)\n", SDL_GetError()); return; }
@@ -1401,6 +1403,10 @@ jobs:
               std::string lastBtn = "(ninguno)";
               int frames = 0, fpsFrames = 0;
               double fpsT = 0, fpsVal = 0;
+              // medicion (cada 5 s en la linea [gx]): ms medios por vuelta de cada fase y cuadros del juego por vuelta
+              auto pcMs = []() { return (double)SDL_GetPerformanceCounter() * 1000.0 / (double)SDL_GetPerformanceFrequency(); };
+              double tRun = 0, tDraw = 0, tSwap = 0;
+              unsigned nIter = 0, nChunks = 0;
 
               while (!quit) {
                   double now = (double)(SDL_GetPerformanceCounter() - t0) / (double)freq;
@@ -1531,6 +1537,7 @@ jobs:
                       Re4CorePad pd = makePad(menuOpen, cur[B_SELECT] || cur[B_GUIDE]);
                       gApi.pad(&pd);
                       int ran = 0;
+                      const double pcRun0 = pcMs();
                       // como mucho ~12 ms de cuadros por vuelta: se dibuja y se muestra seguido en vez de
                       // vaciar hasta 64 cuadros de golpe (eso congelaba la imagen ~2,5 s con el juego corriendo)
                       const Uint32 runStart = SDL_GetTicks();
@@ -1542,6 +1549,9 @@ jobs:
                           ran++;
                           if (SDL_GetTicks() - runStart >= 12) break;
                       }
+                      tRun += pcMs() - pcRun0;
+                      nChunks += (unsigned)ran;
+                      nIter++;
                       if (!ran) gGx->Prewarm(2.0);
                       int st = gApi.state();
                       if (st == RE4_CORE_FAILED || st == RE4_CORE_ENDED) {
@@ -1556,6 +1566,12 @@ jobs:
                           const re4gx::GxStats &g = gGx->Stats();
                           std::printf("[gx] t=%.0fs fps=%.0f chunks=%u draws=%u triangulos=%u programas=%u (de cache %u) texturas=%u errores_shader=%u sin_textura=%u estado_nucleo=%d\n",
                                       now, fpsVal, g.chunks, g.draws, g.triangles, g.programs, g.programsLoaded, g.textures, g.shaderErrors, g.missingTextures, st);
+                          if (nIter) {
+                              std::printf("[gx] medicion: %u vueltas, %.2f cuadros/vuelta, por vuelta: Run %.1f ms, dibujo %.1f ms, swap %.1f ms\n",
+                                          nIter, (double)nChunks / nIter, tRun / nIter, tDraw / nIter, tSwap / nIter);
+                          }
+                          tRun = tDraw = tSwap = 0;
+                          nIter = nChunks = 0;
                       }
                   }
 
@@ -1566,7 +1582,11 @@ jobs:
                   glViewport(0, 0, gw, gh);
                   glClearColor(0, 0, 0, 1);
                   glClear(GL_COLOR_BUFFER_BIT);
-                  if (screen == SC_GAME) pictureShown = drawPicture(gw, gh);
+                  if (screen == SC_GAME) {
+                      const double pcD0 = pcMs();
+                      pictureShown = drawPicture(gw, gh);
+                      tDraw += pcMs() - pcD0;
+                  }
                   glViewport(vx, vy, vw, vh);
                   const bool inGame = (screen == SC_GAME);
                   if (!inGame) {
@@ -1689,7 +1709,9 @@ jobs:
                       SDL_Surface *s = SDL_CreateRGBSurfaceFrom(flip.data(), gw, gh, 32, gw * 4, 0x000000FF, 0x0000FF00, 0x00FF0000, 0xFF000000);
                       if (s) { SDL_SaveBMP(s, shotPath); SDL_FreeSurface(s); std::printf("captura guardada: %s\n", shotPath); }
                   }
+                  const double pcS0 = pcMs();
                   SDL_GL_SwapWindow(win);
+                  tSwap += pcMs() - pcS0;
                   if (screen == SC_GAME && gApi.vsync) {
                       struct timespec ts;
                       clock_gettime(CLOCK_MONOTONIC, &ts);
