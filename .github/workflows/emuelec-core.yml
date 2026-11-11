@@ -1079,8 +1079,20 @@ jobs:
           {
               if (gApi.lib) return true;
               std::string path = exeDir() + "/libre4_main.so";
-              // dibujos fusionados (menos llamadas a la GPU por cuadro, experimental): activo salvo que exista el archivo "sin_fusion" junto al programa
-              if (access((exeDir() + "/sin_fusion").c_str(), F_OK) != 0) setenv("RE4_GX_MERGE", "1", 0);
+              // ajustes por defecto; un archivo vacio junto al programa los cambia:
+              //   debug_activo   -> deja el menu de depuracion del juego y sus barras/textos (para revisiones)
+              //   sin_fusion     -> sin dibujos fusionados      sin_anillo -> sin anillo de vertices
+              //   vsync_pantalla -> el reloj del juego sigue el vsync de la pantalla en vez del suyo
+              {
+                  const std::string d = exeDir();
+                  auto flag = [&](const char *n) { return access((d + "/" + n).c_str(), F_OK) == 0; };
+                  if (!flag("debug_activo")) {
+                      setenv("RE4_DEBUG_HUD", "0", 0);  // sin barras ni textos de la version debug (como la app)
+                      setenv("RE4_ROOM_MENU", "0", 0);  // sin el menu de eleccion de sala al iniciar partida
+                  }
+                  if (!flag("sin_fusion")) setenv("RE4_GX_MERGE", "1", 0);  // dibujos fusionados (menos llamadas a la GPU)
+                  if (!flag("vsync_pantalla")) setenv("RE4_VI_VSYNC", "0", 0);
+              }
               setenv("RE4_GX_THREADS", "2", 0);  // hilos de vertices: 2 (por defecto 1 con 4 nucleos); el lanzador puede cambiarlo
               gApi.lib = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
               if (!gApi.lib) { err = std::string("no pude cargar libre4_main.so: ") + dlerror(); return false; }
@@ -1166,6 +1178,7 @@ jobs:
           {
               gGx = std::make_unique<re4gx::GxRenderer>(re4gx::GxApi::kGl);
               re4gx::GxOptions o;
+              o.vertexRing = access((exeDir() + "/sin_anillo").c_str(), F_OK) != 0;  // vertices en un anillo fijo (Mali: subida mas barata)
               gGx->SetOptions(o);
               const char *cache = std::getenv("RE4_GX_PROGRAM_CACHE");
               if (cache && *cache) {
@@ -1569,6 +1582,26 @@ jobs:
                           if (nIter) {
                               std::printf("[gx] medicion: %u vueltas, %.2f cuadros/vuelta, por vuelta: Run %.1f ms, dibujo %.1f ms, swap %.1f ms\n",
                                           nIter, (double)nChunks / nIter, tRun / nIter, tDraw / nIter, tSwap / nIter);
+                          }
+                          {
+                              static re4gx::GxStats pg;
+                              static bool havePg = false;
+                              const unsigned dc = g.chunks - pg.chunks;
+                              if (havePg && dc) {
+                                  const double k = 1.0 / dc;
+                                  std::printf("[gx] por cuadro: draws %.0f (llamadas GL %.0f), subidas %.1f, cambios de programa %.1f, texturas ligadas %.1f, cambios de estado %.1f, "
+                                              "copias lleno/mitad/prof/peq/pantalla %.1f/%.1f/%.1f/%.1f/%.1f, esperas %.2f, texturas nuevas %.2f\n",
+                                              (g.draws - pg.draws) * k,
+                                              ((g.draws - pg.draws) - (g.mergeTaken - pg.mergeTaken) + (g.mergeBatches - pg.mergeBatches)) * k,
+                                              (g.uniformUploads - pg.uniformUploads) * k, (g.programSwitches - pg.programSwitches) * k,
+                                              (g.textureBinds - pg.textureBinds) * k, (g.stateChanges - pg.stateChanges) * k,
+                                              (g.copyCount[0] - pg.copyCount[0]) * k, (g.copyCount[1] - pg.copyCount[1]) * k,
+                                              (g.copyCount[2] - pg.copyCount[2]) * k, (g.copyCount[3] - pg.copyCount[3]) * k,
+                                              (g.copyCount[4] - pg.copyCount[4]) * k, (g.streamWaits - pg.streamWaits) * k,
+                                              (g.textures - pg.textures) * k);
+                              }
+                              pg = g;
+                              havePg = true;
                           }
                           tRun = tDraw = tSwap = 0;
                           nIter = nChunks = 0;
